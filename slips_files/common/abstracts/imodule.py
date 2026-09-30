@@ -1,0 +1,362 @@
+# SPDX-FileCopyrightText: 2021 Sebastian Garcia <sebastian.garcia@agents.fel.cvut.cz>
+# SPDX-License-Identifier: GPL-2.0-only
+import json
+import os
+import re
+import sys
+import traceback
+import warnings
+from abc import ABC, abstractmethod
+from argparse import Namespace
+from multiprocessing import Process, Event
+from typing import (
+    Dict,
+    Optional,
+)
+from slips_files.common.printer import Printer
+from slips_files.common.output_paths import get_this_db_path_inside_output_dir
+from slips_files.core.helpers.bloom_filters_manager import BFManager
+from slips_files.core.output import Output
+from slips_files.common.slips_utils import utils
+from slips_files.core.database.database_manager import DBManager
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+
+class IModule(ABC, Process):
+    """
+    An interface for all slips modules
+    """
+
+    _SNAKE_CASE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+    name = "imodule"
+    description = "Template module"
+    authors = ["Template Author"]
+    # should be filled with the channels each module subscribes to
+    channels = {}
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """
+        Validate module metadata when subclasses are defined.
+
+        Args:
+            **kwargs: Keyword arguments passed to parent class hooks.
+
+        Returns:
+            None.
+        """
+        super().__init_subclass__(**kwargs)
+        module_name = getattr(cls, "name", None)
+        if IModule._has_snake_case_module_name(module_name):
+            return
+
+        raise RuntimeError(
+            f"{cls.__name__}.name must be snake_case, got " f"{module_name!r}."
+        )
+
+    @staticmethod
+    def _has_snake_case_module_name(module_name: object) -> bool:
+        """
+        Check whether a module name follows the snake_case contract.
+
+        Args:
+            module_name: Class-level module name attribute.
+
+        Returns:
+            True if the module name is a snake_case string, False otherwise.
+        """
+        return isinstance(module_name, str) and bool(
+            IModule._SNAKE_CASE_NAME_PATTERN.fullmatch(module_name)
+        )
+
+    @staticmethod
+    def _is_module_name_registered(module_name: object) -> bool:
+        """
+        Check whether a module name is registered as a supported module.
+        """
+        from modules.supported_module_names import Modules
+
+        return str(module_name) in Modules._value2member_map_
+
+    def __init__(
+        self,
+        logger: Output,
+        output_dir,
+        redis_port,
+        termination_event,
+        slips_args,
+        conf,
+        ppid: int,
+        bloom_filters_manager: BFManager,
+        **kwargs,
+    ):
+        Process.__init__(self)
+        if not self._is_module_name_registered(self.name):
+            raise RuntimeError(
+                f"{type(self).__name__}.name={self.name!r} is not registered "
+                "in modules/supported_module_names.py Please register it."
+            )
+        self.redis_port = redis_port
+        self.parent_output_dir = output_dir
+        self.output_dir = os.path.join(output_dir, self.name)
+        self.msg_received = False
+        # as parsed by arg_parser, these are the cli args
+        self.args: Namespace = slips_args
+        # to be able to access the configuration file
+        self.conf = conf
+        # the parent pid of this module, used for strating the db
+        self.ppid = ppid
+        # used to tell all slips.py children to stop
+        self.termination_event: Event = termination_event
+        self.logger = logger
+        self.bloom_filters: BFManager = bloom_filters_manager
+        self.printer = Printer(self.logger, self.name)
+        self.db = DBManager(
+            self.logger,
+            self.parent_output_dir,
+            self.redis_port,
+            self.conf,
+            self.ppid,
+        )
+        self.db.source_module = self.name
+        self.db.client_setname(self.name)
+        self.keyboard_int_ctr = 0
+        self.slips_version: str = utils.get_slips_version()
+        self.unversioned_channels: frozenset[str] = frozenset()
+        self.init(**kwargs)
+        # should after the module's init() so the module has a chance to
+        # set its own channels
+        # tracks whether or not in the last iteration there was a msg
+        # received in that channel
+        self.channel_tracker: Dict[str, Dict[str, bool]]
+        self.channel_tracker = self.init_channel_tracker()
+
+    def print(self, *args, **kwargs):
+        return self.printer.print(*args, **kwargs)
+
+    def get_module_specific_output_path(self, logfile_name: str) -> str:
+        """returns the full path of the given file inside this
+        module-specific output dir inside the parent_output_dir
+        so if the output dir is slips1, and this module is flow_alerts,
+        and the filename is detection_log.csv
+        this functions returns slips1/flow_alerts/detection_log.csv
+        """
+        os.makedirs(self.output_dir, exist_ok=True)
+        return os.path.join(self.output_dir, logfile_name)
+
+    def get_database_path(self, filename: str) -> str:
+        """
+        this is where any .sqlite database generated by this module
+        should be stored
+        """
+        return get_this_db_path_inside_output_dir(
+            self.parent_output_dir, filename
+        )
+
+    def init_channel_tracker(self) -> Dict[str, Dict[str, bool]]:
+        """
+        tracks if in the last loop, a msg was received in any of the
+        subscribed channels or not
+        the goal of this is to keep looping if only 1 channel did receive
+        a msg, bc it's possible that that 1 channel will receive another msg
+        return a dict with the channel name and the values are either 0 or 1
+        False: received a msg in the last loop for this channel
+        True: didn't receive a msg
+        The goal of this whole thing is to terminate the module only if no
+        channels receive msgs in the last iteration, but keep looping
+        otherwise.
+        """
+        tracker = {}
+        for channel_name in self.channels:
+            tracker[channel_name] = {"msg_received": False}
+        return tracker
+
+    @abstractmethod
+    def init(self, **kwargs):
+        """
+        handles the initialization of modules
+        the goal of this is to have one common __init__() for all
+        modules, which is the one in this file, and a different init() per
+        module
+        this init will have access to all keyword args passes when
+        initializing the module
+        """
+
+    @abstractmethod
+    def subscribe_to_channels(self):
+        """
+        Handles subscription to all needed channels and sets self.channels.
+        """
+
+    def is_msg_received_in_any_channel(self) -> bool:
+        """
+        return True if a msg was received in any channel of the ones
+        this module is subscribed to
+        """
+        return any(
+            info["msg_received"] for info in self.channel_tracker.values()
+        )
+
+    def should_stop(self) -> bool:
+        """
+        The module should stop on the following 2 conditions
+        1. no new msgs are received in any of the channels the
+            module is subscribed to
+        2. the termination event is set by the process_manager.py
+        """
+        if (
+            self.is_msg_received_in_any_channel()
+            or not self.termination_event.is_set()
+        ):
+            # this module is still receiving msgs,
+            # don't stop
+            return False
+
+        return True
+
+    def _shutdown_gracefully(self):
+        """
+        necessary cleanup/shutdown logic goes here. e.g closing of opened
+        threads, queue,
+        log lines to indicate the module is done, etc.
+        """
+
+        if hasattr(self, "shutdown_gracefully"):
+            # module-specific cleanup.
+            # should be implemented in the module
+            self.shutdown_gracefully()
+
+        # common cleanup
+        if self.channels:
+            for channel_obj in self.channels.values():
+                self.db.unsubscribe(channel_obj)
+
+        # each module has its own sqlite db connection. once this module is
+        # done the connection should be closed
+        self.db.close_sqlite()
+
+    @abstractmethod
+    def main(self):
+        """
+        Main function of every module, all the logic implemented
+        here will be executed in a loop
+        """
+
+    def pre_main(self) -> bool:
+        """
+        This function is for initializations that are
+        executed once before the main loop.
+        if any initialization function takes too long, it goes here instead
+         of init() in order to avoid slowing down the startup of slips modules.
+        """
+
+    def _pre_main(self):
+        """
+        Common pre-main logic: subscribe to channels, init tracker, then
+        run module-specific pre_main if defined.
+        """
+        self.subscribe_to_channels()
+        self.channel_tracker = self.init_channel_tracker()
+        return self.pre_main()
+
+    def is_msg_version_compatible(self, message: dict, channel: str) -> bool:
+        """
+        Check whether the incoming pub/sub message matches this module's
+        Slips version.
+
+        Parameters:
+            message: Redis pub/sub message containing a JSON payload.
+            channel: Channel on which the message was received.
+
+        Returns:
+            True for the current Slips version, or for an explicitly allowed
+            unversioned compatibility channel.
+        """
+        if not message or "data" not in message:
+            return False
+
+        data = message["data"]
+        if not isinstance(data, str):
+            return False
+
+        try:
+            payload = json.loads(data)
+        except (json.decoder.JSONDecodeError, TypeError):
+            return False
+
+        if not isinstance(payload, dict):
+            return False
+
+        version = payload.get("version")
+        if version == self.slips_version:
+            return True
+        return version is None and channel in self.unversioned_channels
+
+    def get_msg(self, channel: str) -> Optional[dict]:
+        try:
+            if channel not in self.channels:
+                self.print(
+                    f"Module didn't subscribe to {channel} and is "
+                    f"trying to get msgs from it."
+                )
+                return None
+
+            message = self.db.get_message(self.channels[channel])
+            if utils.is_msg_intended_for(message, channel):
+                # discard msgs if sent be a newer/older version of slips.
+                # may happen temporarily during handover, where the new
+                # version starts  before the old version stops.
+                if not self.is_msg_version_compatible(message, channel):
+                    self.channel_tracker[channel]["msg_received"] = False
+                    return None
+                self.channel_tracker[channel]["msg_received"] = True
+                self.db.incr_msgs_received_in_channel(self.name, channel)
+                return message
+
+            self.channel_tracker[channel]["msg_received"] = False
+        except KeyboardInterrupt:
+            return None
+
+    def print_traceback(self):
+        exception_line = sys.exc_info()[2].tb_lineno
+        self.print(f"Problem in line {exception_line}", 0, 1)
+        self.print(traceback.format_exc(), 0, 1)
+
+    def run(self):
+        """
+        some modules use async functions like flow_alerts,
+        the goals of this function is to make sure that async and normal
+        shutdown_gracefully() functions run until completion
+        """
+        try:
+            error: bool = self._pre_main()
+            if error or self.should_stop():
+                self._shutdown_gracefully()
+                return
+        except KeyboardInterrupt:
+            self._shutdown_gracefully()
+            return
+        except Exception:
+            self.print_traceback()
+            return
+
+        while True:
+            try:
+                if self.should_stop():
+                    self._shutdown_gracefully()
+                    return
+
+                error: bool = self.main()
+                if error:
+                    self._shutdown_gracefully()
+                    return
+
+            except KeyboardInterrupt:
+                self.keyboard_int_ctr += 1
+                if self.keyboard_int_ctr >= 2:
+                    return
+
+                continue
+            except Exception:
+                self.print_traceback()
+                return

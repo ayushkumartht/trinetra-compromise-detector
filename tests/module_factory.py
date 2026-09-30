@@ -1,0 +1,1593 @@
+# SPDX-FileCopyrightText: 2021 Sebastian Garcia <sebastian.garcia@agents.fel.cvut.cz>
+# SPDX-License-Identifier: GPL-2.0-only
+import shutil
+import importlib.util
+import sys
+from contextlib import contextmanager
+from types import ModuleType
+from unittest.mock import (
+    patch,
+    Mock,
+    MagicMock,
+    mock_open,
+)
+import os
+from slips_files.common.input_type import InputType
+from multiprocessing import Queue
+
+import unittest.mock as mock
+
+
+def read_configuration():
+    return
+
+
+def check_zeek_or_bro():
+    """
+    Check if we have zeek or bro
+    """
+    if shutil.which("zeek"):
+        return "zeek"
+    if shutil.which("bro"):
+        return "bro"
+    return False
+
+
+MODULE_DB_MANAGER = "slips_files.common.abstracts.imodule.DBManager"
+DB_MANAGER = "slips_files.core.database.database_manager.DBManager"
+
+
+class ModuleFactory:
+    def __init__(self):
+        self.profiler_queue = Queue()
+        self.input_queue = Queue()
+        self.logger = Mock()
+
+    def get_default_db(self):
+        """default is o port 6379, this is the one we're using in conftest"""
+        return self.create_db_manager_obj(6379)
+
+    def mocked_init_flock(self):
+        self.lockfile_path = "/tmp/fake.lock"
+
+    def create_db_manager_obj(
+        self,
+        port,
+        output_dir="output/",
+        flush_db=False,
+        start_redis_server=True,
+        disabled_detections: list[str] | None = None,
+    ):
+        from slips_files.core.database.database_manager import DBManager
+
+        """
+        flush_db is False by default  because we use this function to check
+        the db after integration tests to make sure everything's going fine
+        """
+
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = None
+        mock_ctx.__exit__.return_value = None
+
+        conf = Mock()
+        conf.delete_prev_db = Mock(return_value=False)
+        conf.disabled_detections = Mock(return_value=disabled_detections or [])
+        conf.evidence_signal_default = Mock(return_value="PAMP")
+        conf.evidence_signal_overrides = Mock(
+            return_value={
+                "ANOMALOUS_FLOW": "DAMP",
+                "MALICIOUS_FLOW": "DAMP",
+            }
+        )
+        conf.get_tw_width_as_float = Mock(return_value=3600.0)
+        conf.get_tw_width_in_seconds = Mock(return_value=3600)
+        conf.get_args = Mock(return_value=Mock(killall=False))
+        conf.client_ips = Mock(return_value=[])
+        conf.use_local_p2p = Mock(return_value=False)
+        conf.permanent_dir = Mock(return_value="permanent")
+        conf.width = Mock(return_value=3600)
+        conf.regex_generator_store_dir = Mock(
+            return_value=os.path.join(output_dir, "regex_generator")
+        )
+        conf.regex_generator_persistent_store_dir = Mock(return_value="")
+        conf.regex_generator_store_rejected_regexes = Mock(return_value=False)
+        conf.regex_generator_max_stored_rejected_regexes = Mock(
+            return_value=10000
+        )
+        conf.regex_generator_seed_benign_samples = Mock(return_value=True)
+        conf.t_cell_store_dir = Mock(
+            return_value=os.path.join(output_dir, "t_cell")
+        )
+        conf.t_cell_persistent_store_dir = Mock(return_value="")
+        conf.tranco_top_benign_limit = Mock(return_value=1000)
+
+        with (
+            # to prevent config/redis.conf from being overwritten
+            patch(
+                "slips_files.core.database.redis_db.database."
+                "RedisDB._setup_config_file",
+                return_value=Mock(),
+            ),
+            patch(
+                "slips_files.core.database.redis_db.database.RedisDB._conf_file",
+                "config/redis.conf.template",
+            ),
+            patch(
+                "slips_files.core.database.redis_db.database.ConfigParser",
+                return_value=conf,
+            ),
+            patch("builtins.open", new_callable=mock.mock_open),
+        ):
+            db = DBManager(
+                logger=self.logger,
+                output_dir=output_dir,
+                redis_port=port,
+                conf=conf,
+                main_pid=12345,
+                flush_db=flush_db,
+                start_sqlite=False,
+                start_redis_server=start_redis_server,
+            )
+
+        db.print = Mock()
+        db.init_p2p_trust_db = Mock()
+        # for easier access to redis db
+        db.r = db.rdb.r
+        assert db.get_used_redis_port() == port
+        return db
+
+    def create_main_obj(self):
+        try:
+            from slips.main import Main
+        except ModuleNotFoundError:
+            module_spec = importlib.util.spec_from_file_location(
+                "slips_main_for_tests", os.path.join("slips", "main.py")
+            )
+            module = importlib.util.module_from_spec(module_spec)
+            sys.modules[module_spec.name] = module
+            module_spec.loader.exec_module(module)
+            Main = module.Main
+
+        """returns an instance of Main() class in slips.py"""
+        main = Main(testing=True)
+        main.input_information = ""
+        main.input_type = InputType.PCAP
+        main.line_type = False
+        main.args = Mock()
+        return main
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_http_analyzer_obj(self, mock_db):
+        from modules.http_analyzer.http_analyzer import HTTPAnalyzer
+
+        http_analyzer = HTTPAnalyzer(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        http_analyzer.print = Mock()
+        return http_analyzer
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_llm_obj(self, mock_db):
+        from modules.llm_proxy.llm_proxy import LLMProxy
+
+        conf = Mock()
+        conf.llm_enabled = Mock(return_value=True)
+        conf.llm_default_backend = Mock(return_value="local_qwen")
+        conf.llm_worker_threads = Mock(return_value=1)
+        conf.llm_queue_size = Mock(return_value=10)
+        conf.llm_backends = Mock(
+            return_value={
+                "local_qwen": {
+                    "provider": "ollama",
+                    "model": "qwen2.5:3b",
+                    "base_url": "http://127.0.0.1:11434",
+                    "timeout": 60,
+                }
+            }
+        )
+
+        llm = LLMProxy(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=conf,
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        llm.db.channels.LLM_REQUEST = "llm_request"
+        llm.db.channels.LLM_RESPONSE = "llm_response"
+        llm.channels = {"llm_request": llm.c1}
+        llm.db.reset_pending_llm_request_counts = Mock()
+        llm.db.increment_pending_llm_request_count = Mock(return_value=1)
+        llm.db.decrement_pending_llm_request_count = Mock(return_value=0)
+        llm.db.get_pid_of = Mock(return_value=None)
+        llm.print = Mock()
+        return llm
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_regex_generator_obj(
+        self, mock_db, store_dir="dummy_output_dir/regex_generator"
+    ):
+        from modules.regex_generator.regex_generator import RegexGenerator
+
+        conf = Mock()
+        conf.regex_generator_enabled = Mock(return_value=True)
+        conf.regex_generator_create_log_file = Mock(return_value=False)
+        conf.regex_generator_generation_interval_seconds = Mock(return_value=5)
+        conf.regex_generator_allowed_backends = Mock(
+            return_value=["local_qwen"]
+        )
+        conf.regex_generator_llm_temperature = Mock(return_value=1.2)
+        conf.regex_generator_llm_max_tokens = Mock(return_value=80)
+        conf.regex_generator_llm_response_timeout_seconds = Mock(
+            return_value=90
+        )
+        conf.regex_generator_recent_history_size = Mock(return_value=0)
+        conf.regex_generator_max_regex_length = Mock(return_value=180)
+        conf.regex_generator_regex_validation_timeout_seconds = Mock(
+            return_value=2
+        )
+        conf.regex_generator_benign_match_strength_threshold = Mock(
+            return_value=75
+        )
+        conf.regex_generator_type_weights = Mock(
+            return_value={
+                "dns_domain": 1,
+                "uri": 1,
+                "filename": 1,
+                "tls_sni": 1,
+                "certificate_cn": 1,
+            }
+        )
+        conf.regex_generator_store_dir = Mock(return_value=store_dir)
+        conf.regex_generator_persistent_store_dir = Mock(return_value="")
+        conf.regex_generator_store_rejected_regexes = Mock(return_value=False)
+        conf.regex_generator_max_stored_rejected_regexes = Mock(
+            return_value=10000
+        )
+        conf.regex_generator_seed_benign_samples = Mock(return_value=True)
+        conf.tranco_top_benign_limit = Mock(return_value=1000)
+        conf.rotation = Mock(return_value=True)
+        conf.default_rotation_interval = Mock(return_value="1day")
+        conf.rotation_period = Mock(return_value="1day")
+
+        regex_generator = RegexGenerator(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=conf,
+            ppid=12345,
+            bloom_filters_manager=Mock(),
+        )
+        regex_generator.db.channels.LLM_REQUEST = "llm_request"
+        regex_generator.db.channels.LLM_RESPONSE = "llm_response"
+        regex_generator.channels = {
+            "llm_response": regex_generator.c_llm,
+            "tw_closed": regex_generator.c_tw_closed,
+        }
+        regex_generator.print = Mock()
+        return regex_generator
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_alert_summary_obj(self, mock_db):
+        from modules.alert_summary.alert_summary import AlertSummary
+
+        conf = Mock()
+        conf.alert_summary_enabled = Mock(return_value=True)
+        conf.alert_summary_allowed_backends = Mock(return_value=["local_qwen"])
+        conf.alert_summary_log_verbosity = Mock(return_value=2)
+        conf.alert_summary_llm_temperature = Mock(return_value=0.2)
+        conf.alert_summary_llm_max_tokens = Mock(return_value=220)
+        conf.alert_summary_llm_response_timeout_seconds = Mock(
+            return_value=120
+        )
+        conf.alert_summary_history_enabled = Mock(return_value=True)
+        conf.alert_summary_history_max_alerts = Mock(return_value=3)
+        conf.alert_summary_history_max_tokens = Mock(return_value=700)
+        conf.alert_summary_history_patterns_per_alert = Mock(return_value=2)
+
+        args = Mock()
+        args.is_slips_started_by_an_update = False
+
+        alert_summary = AlertSummary(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=args,
+            conf=conf,
+            ppid=12345,
+            bloom_filters_manager=Mock(),
+        )
+        alert_summary.db.channels.LLM_REQUEST = "llm_request"
+        alert_summary.db.channels.LLM_RESPONSE = "llm_response"
+        alert_summary.subscribe_to_channels()
+        alert_summary.db.get_available_llm_backends = Mock(
+            return_value={
+                "default_backend": "local_qwen",
+                "backends": {
+                    "local_qwen": {
+                        "provider": "ollama",
+                        "model": "qwen2.5:3b",
+                    }
+                },
+            }
+        )
+        alert_summary.db.get_pending_llm_request_count = Mock(return_value=0)
+        alert_summary.db.get_twid_evidence = Mock(return_value={})
+        alert_summary.db.get_hostname_from_profile = Mock(return_value="")
+        alert_summary.db.get_pid_of = Mock(return_value=None)
+        alert_summary.print = Mock()
+        return alert_summary
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_t_cell_obj(self, mock_db):
+        from modules.t_cell.t_cell import TCell
+
+        conf = Mock()
+        conf.t_cell_enabled = Mock(return_value=True)
+        conf.t_cell_create_log_file = Mock(return_value=True)
+        conf.t_cell_log_colors = Mock(return_value=True)
+        conf.t_cell_log_verbosity = Mock(return_value=1)
+        conf.t_cell_decision_trace_mode = Mock(return_value=0)
+        conf.t_cell_decision_trace_file = Mock(
+            return_value="t_cell_trace.jsonl"
+        )
+        conf.t_cell_decision_trace_max_evidence = Mock(return_value=10)
+        conf.get_tw_width_in_seconds = Mock(return_value=3600.0)
+        conf.t_cell_store_dir = Mock(return_value="dummy_output_dir/t_cell")
+        conf.t_cell_persistent_store_dir = Mock(return_value="")
+        conf.t_cell_observation_retention_seconds = Mock(return_value=604800)
+        conf.t_cell_anergy_ttl_seconds = Mock(return_value=21600)
+        conf.t_cell_related_lookback_seconds = Mock(return_value=3600)
+        conf.t_cell_related_pamps_saturation = Mock(return_value=5.0)
+        conf.t_cell_danger_saturation = Mock(return_value=2.5)
+        conf.t_cell_damp_danger_weight = Mock(return_value=1.5)
+        conf.t_cell_co_stimulation_threshold = Mock(return_value=0.65)
+        conf.t_cell_co_stimulation_weights = Mock(
+            return_value={
+                "confidence": 0.35,
+                "related_pamps": 0.25,
+                "danger": 0.40,
+            }
+        )
+        conf.t_cell_priming_profiles = Mock(
+            return_value={
+                "PAMP": {
+                    "strength": 1.0,
+                    "co_stimulation_threshold_offset": 0.0,
+                    "effector_threshold_offset": 0.0,
+                    "memory_threshold_offset": 0.0,
+                    "state_wait_timeout_factor": 1.0,
+                    "effector_min_related_count_offset": 0,
+                    "memory_min_related_count_offset": 0,
+                },
+                "DAMP": {
+                    "strength": 0.6,
+                    "co_stimulation_threshold_offset": 0.15,
+                    "effector_threshold_offset": 0.10,
+                    "memory_threshold_offset": 0.05,
+                    "state_wait_timeout_factor": 0.5,
+                    "effector_min_related_count_offset": 1,
+                    "memory_min_related_count_offset": 1,
+                },
+            }
+        )
+        conf.t_cell_novelty_window_seconds = Mock(return_value=86400)
+        conf.t_cell_context_recent_window_seconds = Mock(return_value=1800)
+        conf.t_cell_effector_threshold = Mock(return_value=0.70)
+        conf.t_cell_effector_min_related_count = Mock(return_value=4)
+        conf.t_cell_effector_cooldown_seconds = Mock(return_value=1800)
+        conf.t_cell_memory_threshold = Mock(return_value=0.60)
+        conf.t_cell_memory_trend_ratio_max = Mock(return_value=0.60)
+        conf.t_cell_memory_min_related_count = Mock(return_value=3)
+        conf.t_cell_simulate_effector_without_blocking = Mock(
+            return_value=True
+        )
+
+        args = Mock()
+        args.interface = None
+        args.access_point = False
+
+        t_cell = TCell(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=args,
+            conf=conf,
+            ppid=12345,
+            bloom_filters_manager=Mock(),
+        )
+        t_cell.db.get_generated_regexes.return_value = []
+        t_cell.db.get_generated_regexes_count.return_value = 0
+        t_cell.db.get_enabled_modules.return_value = [
+            "t_cell",
+            "regex_generator",
+        ]
+        t_cell.db.get_altflow_from_uid.return_value = {}
+        t_cell.db.get_pid_of.return_value = None
+        t_cell.db.publish = Mock()
+        t_cell.print = Mock()
+        return t_cell
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_fides_obj(self, mock_db):
+        from modules.fides.fides import FidesModule
+
+        db_path = os.path.join("permanent", "databases", "fides_p2p_db.sqlite")
+        config_path = os.path.join(
+            "modules", "fides", "config", "fides.conf.yml"
+        )
+
+        def get_permanent_database_path(_filename):
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            return db_path
+
+        mock_db.return_value.get_permanent_database_path.side_effect = (
+            get_permanent_database_path
+        )
+        conf = Mock()
+        conf.read_configuration = Mock(return_value=config_path)
+
+        fm = FidesModule(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=conf,
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        fm.print = Mock()
+        return fm
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_virustotal_obj(self, mock_db):
+        from modules.virustotal.virustotal import VT
+
+        virustotal = VT(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        virustotal.print = Mock()
+        virustotal.__read_configuration = Mock()
+        return virustotal
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_arp_obj(self, mock_db):
+        from modules.arp.arp import ARP
+
+        with patch(
+            "modules.arp.arp.ARP.wait_for_arp_scans", return_value=Mock()
+        ):
+            arp = ARP(
+                logger=self.logger,
+                output_dir="dummy_output_dir",
+                redis_port=6379,
+                termination_event=Mock(),
+                slips_args=Mock(),
+                conf=Mock(),
+                ppid=Mock(),
+                bloom_filters_manager=Mock(),
+            )
+        arp.print = Mock()
+        arp.evidence_filter.is_slips_peer = Mock(return_value=False)
+        return arp
+
+    def create_checker_obj(self):
+        from slips_files.core.helpers.checker import Checker
+
+        mock_main = Mock()
+        mock_main.args = MagicMock()
+        mock_main.args.output = "test_output"
+        mock_main.args.verbose = "0"
+        mock_main.args.debug = "0"
+        mock_main.redis_man = Mock()
+        mock_main.terminate_slips = Mock()
+        mock_main.print_version = Mock()
+        mock_main.get_input_file_type = Mock()
+        mock_main.handle_flows_from_stdin = Mock()
+        mock_main.pid = 12345
+
+        checker = Checker(mock_main)
+        return checker
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_go_director_obj(self, mock_db):
+        from modules.p2p_trust.trust.trustdb import TrustDB
+        from modules.p2p_trust.utils.go_director import GoDirector
+
+        with patch("modules.p2p_trust.utils.utils.send_evaluation_to_go"):
+            go_director = GoDirector(
+                logger=self.logger,
+                trustdb=Mock(spec=TrustDB),
+                db=mock_db,
+                storage_name="test_storage",
+                override_p2p=False,
+                gopy_channel="test_gopy",
+                pygo_channel="test_pygo",
+                p2p_reports_logfile="test_reports.log",
+            )
+            go_director.print = Mock()
+        return go_director
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_daemon_object(self, mock_db):
+        try:
+            from slips.daemon import Daemon
+
+            daemon_module = "slips.daemon"
+        except ModuleNotFoundError:
+            module_spec = importlib.util.spec_from_file_location(
+                "slips_daemon_for_tests", os.path.join("slips", "daemon.py")
+            )
+            module = importlib.util.module_from_spec(module_spec)
+            sys.modules[module_spec.name] = module
+            module_spec.loader.exec_module(module)
+            Daemon = module.Daemon
+            daemon_module = module_spec.name
+
+        with (
+            patch(f"{daemon_module}.Daemon.read_pidfile", return_value=None),
+            patch(f"{daemon_module}.Daemon.read_configuration"),
+            patch("builtins.open", mock_open(read_data=None)),
+        ):
+            slips = MagicMock()
+            slips.args.stopdaemon = True
+            slips.args.is_slips_started_by_an_update = False
+            slips.args.output = "output"
+            daemon = Daemon(slips)
+        daemon.stderr = "errors.log"
+        daemon.stdout = "slips.log"
+        daemon.stdin = "/dev/null"
+        daemon.logsfile = "slips.log"
+        daemon.pidfile_dir = "/tmp"
+        daemon.pidfile = os.path.join(daemon.pidfile_dir, "slips_daemon.lock")
+        daemon.daemon_start_lock = "slips_daemon_start"
+        daemon.daemon_stop_lock = "slips_daemon_stop"
+        return daemon
+
+    @contextmanager
+    def dummy_acquire_flock(self):
+        yield
+
+    @patch("sqlite3.connect")
+    def create_trust_db_obj(self, sqlite_mock):
+        from modules.p2p_trust.trust.trustdb import TrustDB
+
+        with (
+            patch("slips_files.common.abstracts.isqlite.ISQLite._init_flock"),
+            patch(
+                "slips_files.common.abstracts.isqlite.ISQLite._acquire_flock"
+            ),
+        ):
+            trust_db = TrustDB(
+                logger=self.logger,
+                db_file=Mock(),
+                main_pid=Mock(),
+                drop_tables_on_startup=False,
+            )
+        trust_db.conn = Mock()
+        trust_db.print = Mock()
+        trust_db._init_flock = Mock()
+        trust_db._acquire_flock = MagicMock()
+        return trust_db
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_base_model_obj(self, mock_db):
+        from modules.p2p_trust.trust.base_model import BaseModel
+        from slips_files.core.output import Output
+
+        logger = Mock(spec=Output)
+        trustdb = Mock()
+        return BaseModel(logger, trustdb, mock_db)
+
+    def create_notify_obj(self):
+        from slips_files.core.helpers.notify import Notify
+
+        notify = Notify()
+        return notify
+
+    def create_ioc_handler_obj(self):
+        from slips_files.core.database.redis_db.constants import (
+            Constants,
+            Channels,
+        )
+        from slips_files.core.database.redis_db.ioc_handler import IoCHandler
+
+        handler = IoCHandler()
+        handler.r = Mock()
+        handler.rcache = Mock()
+        handler.constants = Constants()
+        handler.channels = Channels()
+        handler.default_ttl = 3600
+        handler.extended_ttl = 3600
+        return handler
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_arp_filter_obj(self, mock_db):
+        from modules.arp.filter import ARPEvidenceFilter
+
+        filter = ARPEvidenceFilter(Mock(), Mock(), mock_db)  # conf  # args
+        return filter
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_blocking_obj(self, mock_db):
+        from modules.blocking.blocking import Blocking
+
+        with (
+            patch(
+                "modules.blocking.blocking.utils.get_sudo_according_to_env",
+                return_value="",
+            ),
+            patch(
+                "modules.blocking.blocking.shutil.which",
+                return_value="/sbin/iptables",
+            ),
+            patch.object(
+                Blocking, "_init_chains_in_firewall", return_value=None
+            ),
+        ):
+            blocking = Blocking(
+                logger=self.logger,
+                output_dir="dummy_output_dir",
+                redis_port=6379,
+                termination_event=Mock(),
+                slips_args=Mock(),
+                conf=Mock(),
+                ppid=Mock(),
+                bloom_filters_manager=Mock(),
+            )
+        # override the print function to avoid broken pipes
+        blocking.print = Mock()
+        blocking.blocking_log_path = Mock()
+        blocking.unblocker = Mock()
+        return blocking
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_unblocker_obj(self, mock_db):
+        from modules.blocking.unblocker import Unblocker
+
+        with patch.object(
+            Unblocker, "_start_checker_thread", return_value=None
+        ):
+            unblocker = Unblocker(
+                mock_db,
+                "",  # sudo
+                Mock(return_value=False),
+                self.logger,
+                Mock(),  # mocking log()
+            )
+        unblocker.print = Mock()
+        return unblocker
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_flowalerts_obj(self, mock_db):
+        from modules.flow_alerts.flow_alerts import FlowAlerts
+
+        flowalerts = FlowAlerts(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        flowalerts.print = Mock()
+        return flowalerts
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_brute_force_detector_obj(self, mock_db):
+        from modules.brute_force_detector.brute_force_detector import (
+            BruteforceDetector,
+        )
+
+        brute_force_detector = BruteforceDetector(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        brute_force_detector.print = Mock()
+        return brute_force_detector
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_dns_analyzer_obj(self, mock_db):
+        from modules.flow_alerts.dns import DNS
+
+        flowalerts = self.create_flowalerts_obj()
+        return DNS(flowalerts.db, flowalerts=flowalerts)
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_notice_analyzer_obj(self, mock_db):
+        from modules.flow_alerts.notice import Notice
+
+        flowalerts = self.create_flowalerts_obj()
+        return Notice(flowalerts.db, flowalerts=flowalerts)
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_smtp_analyzer_obj(self, mock_db):
+        from modules.flow_alerts.smtp import SMTP
+
+        flowalerts = self.create_flowalerts_obj()
+        return SMTP(flowalerts.db, flowalerts=flowalerts)
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_ssl_analyzer_obj(self, mock_db):
+        from modules.flow_alerts.ssl import SSL
+
+        flowalerts = self.create_flowalerts_obj()
+        return SSL(flowalerts.db, flowalerts=flowalerts)
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_ssh_analyzer_obj(self, mock_db):
+        from modules.flow_alerts.ssh import SSH
+
+        flowalerts = self.create_flowalerts_obj()
+        return SSH(flowalerts.db, flowalerts=flowalerts)
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_downloaded_file_analyzer_obj(self, mock_db):
+        from modules.flow_alerts.downloaded_file import DownloadedFile
+
+        flowalerts = self.create_flowalerts_obj()
+        return DownloadedFile(flowalerts.db, flowalerts=flowalerts)
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_tunnel_analyzer_obj(self, mock_db):
+        from modules.flow_alerts.tunnel import Tunnel
+
+        flowalerts = self.create_flowalerts_obj()
+        return Tunnel(flowalerts.db, flowalerts=flowalerts)
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_conn_analyzer_obj(self, mock_db):
+        from modules.conn_analyzer.conn_analyzer import ConnAnalyzer
+
+        conn_analyzer = ConnAnalyzer(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        conn_analyzer.print = Mock()
+        return conn_analyzer
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_software_analyzer_obj(self, mock_db):
+        from modules.flow_alerts.software import Software
+
+        flowalerts = self.create_flowalerts_obj()
+        return Software(flowalerts.db, flowalerts=flowalerts)
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_login_analyzer_obj(self, mock_db):
+        """Create a login analyzer test instance."""
+        from modules.flow_alerts.login import Login
+
+        flowalerts = self.create_flowalerts_obj()
+        return Login(flowalerts.db, flowalerts=flowalerts)
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_ip_info_obj(self, mock_db):
+        from modules.ip_info.ip_info import IPInfo
+
+        ip_info = IPInfo(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        ip_info.print = Mock()
+        return ip_info
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_input_obj(
+        self, input_information, input_type, mock_db, line_type=False
+    ):
+        from slips_files.core.input import Input
+        from slips_files.core.output import Output
+
+        input = Input(
+            logger=Output(),
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(output="dummy_output_dir"),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+            is_input_done=Mock(),
+            profiler_queue=self.profiler_queue,
+            input_type=input_type,
+            input_information=input_information,
+            cli_packet_filter=None,
+            zeek_or_bro=check_zeek_or_bro(),
+            line_type=line_type,
+            is_profiler_done_event=Mock(),
+            is_input_failed_event=Mock(),
+        )
+        input.db = mock_db
+        input.mark_self_as_done_processing = Mock()
+        input.bro_timeout = 1
+        # override the print function to avoid broken pipes
+        input.print = Mock()
+        input.stop_queues = Mock()
+        input.testing = True
+
+        return input
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_asn_obj(self, mock_db):
+        from modules.ip_info.asn_info import ASN
+
+        return ASN(mock_db)
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_leak_detector_obj(self, mock_db):
+        from modules.leak_detector.leak_detector import LeakDetector
+
+        test_pcap = "dataset/test7-malicious.pcap"
+        yara_rules_path = "tests/yara_rules_for_testing/rules/"
+        compiled_yara_rules_path = "tests/yara_rules_for_testing/compiled/"
+        leak_detector = LeakDetector(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        leak_detector.print = Mock()
+        # this is the path containing 1 yara rule for testing,
+        # it matches every pcap
+        leak_detector.yara_rules_path = yara_rules_path
+        leak_detector.compiled_yara_rules_path = compiled_yara_rules_path
+        leak_detector.pcap = test_pcap
+        return leak_detector
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_profiler_obj(self, mock_db):
+        from slips_files.core.profiler import Profiler
+
+        slips_args = Mock()
+        slips_args.interface = False
+        is_input_done_event = Mock()
+        is_input_done_event.is_set.return_value = False
+        is_input_failed_event = Mock()
+        is_input_failed_event.is_set.return_value = False
+        profiler = Profiler(
+            logger=self.logger,
+            output_dir="output",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=slips_args,
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+            is_profiler_done_semaphore=Mock(),
+            profiler_queue=self.input_queue,
+            is_profiler_done_event=Mock(),
+            is_input_done_event=is_input_done_event,
+            is_input_failed_event=is_input_failed_event,
+            is_profiler_done_starting_initial_workers_event=Mock(),
+        )
+        profiler.print = Mock()
+        profiler.local_whitelist_path = "tests/unit/test_whitelist.conf"
+        profiler.db = mock_db
+        return profiler
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_profiler_worker_obj(self, mock_db):
+        from slips_files.core.profiler_worker import ProfilerWorker
+
+        profiler = ProfilerWorker(
+            logger=self.logger,
+            output_dir="output",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+            name="mock_name",
+            profiler_queue=Mock(),
+            input_handler=Mock(),
+            aid_queue=Mock(),
+            aid_manager=Mock(),
+            is_input_done_event=Mock(),
+        )
+        profiler.print = Mock()
+        profiler.db = mock_db
+        return profiler
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_redis_manager_obj(self, mock_db):
+        from managers.redis_manager import RedisManager
+
+        main = self.create_main_obj()
+        main.db = mock_db
+        main.args = Mock()
+        return RedisManager(main)
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_profilers_manager_obj(self, mock_db):
+        from managers.profilers_manager import ProfilersManager
+
+        main = self.create_main_obj()
+        main.db = mock_db
+        main.args = Mock()
+        return ProfilersManager(main)
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_host_ip_manager_obj(self, mock_db):
+        from managers.host_ip_manager import HostIPManager
+
+        main = self.create_main_obj()
+        main.db = mock_db
+        main.print = Mock()
+        return HostIPManager(main)
+
+    def create_utils_obj(self):
+        from slips_files.common.slips_utils import utils
+
+        return utils
+
+    def create_flow_alert_utils_obj(self) -> ModuleType:
+        """
+        Create a flow alerts utils module instance for unit tests.
+
+        Return:
+        ModuleType: The flow alerts utils module.
+        """
+        from modules.flow_alerts import utils as flow_alert_utils
+
+        return flow_alert_utils
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_threatintel_obj(self, mock_db):
+        from modules.threat_intelligence.threat_intelligence import ThreatIntel
+
+        threatintel = ThreatIntel(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        threatintel.print = Mock()
+        return threatintel
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_spamhaus_obj(self, mock_db):
+        from modules.threat_intelligence.spamhaus import Spamhaus
+
+        return Spamhaus(mock_db)
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_update_manager_obj(self, mock_db):
+        from modules.feeds_update_manager.feeds_update_manager import (
+            FeedsUpdateManager,
+        )
+
+        update_manager = FeedsUpdateManager(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        update_manager.print = Mock()
+        return update_manager
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_whitelist_obj(self, mock_db):
+        from slips_files.core.helpers.whitelist.whitelist import Whitelist
+
+        bloom_filter_manager_mock = Mock()
+        whitelist = Whitelist(
+            self.logger,
+            mock_db,
+            bloom_filter_manager=bloom_filter_manager_mock,
+        )
+        # override the self.print function to avoid broken pipes
+        whitelist.print = Mock()
+        whitelist.whitelist_path = "tests/unit/test_whitelist.conf"
+        return whitelist
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_flow_handler_obj(self, flow, mock_db):
+        from slips_files.core.helpers.flow_handler import FlowHandler
+        from slips_files.core.helpers.symbols_handler import SymbolHandler
+
+        symbol = SymbolHandler(self.logger, mock_db)
+        profileid = "profile_id"
+        twid = "timewindow1"
+        flow_handler = FlowHandler(
+            mock_db, symbol, flow, profileid, twid, False
+        )
+        return flow_handler
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_horizontal_portscan_obj(self, mock_db):
+        from modules.network_discovery.horizontal_portscan import (
+            HorizontalPortscan,
+        )
+
+        horizontal_ps = HorizontalPortscan(mock_db)
+        return horizontal_ps
+
+    @patch(DB_MANAGER, name="mock_db")
+    def create_vertical_portscan_obj(self, mock_db):
+        from modules.network_discovery.vertical_portscan import (
+            VerticalPortscan,
+        )
+
+        vertical_ps = VerticalPortscan(mock_db)
+        return vertical_ps
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_urlhaus_obj(self, mock_db):
+        from modules.threat_intelligence.urlhaus import URLhaus
+
+        """Create an instance of URLhaus."""
+        urlhaus = URLhaus(mock_db)
+        return urlhaus
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_circllu_obj(self, mock_db):
+        from modules.threat_intelligence.circl_lu import Circllu
+
+        """Create an instance of Circllu."""
+        return Circllu(mock_db, Queue())
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_set_evidence_helper(self, mock_db):
+        from modules.flow_alerts.set_evidence import SetEvidenceHelper
+
+        """Create an instance of SetEvidenceHelper."""
+        set_evidence_helper = SetEvidenceHelper(mock_db)
+        return set_evidence_helper
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_conn_analyzer_set_evidence_helper(self, mock_db):
+        from modules.conn_analyzer.set_evidence import SetEvidenceHelper
+
+        """Create an instance of conn_analyzer's SetEvidenceHelper."""
+        set_evidence_helper = SetEvidenceHelper(mock_db)
+        return set_evidence_helper
+
+    def create_output_obj(self):
+        from slips_files.core.output import Output
+
+        return Output()
+
+    def create_attacker_obj(
+        self,
+        value="192.168.1.1",
+        direction=None,
+        ioc_type=None,
+    ):
+        from slips_files.core.structures.evidence import (
+            Attacker,
+            Direction,
+            IoCType,
+        )
+
+        if direction is None:
+            direction = Direction.SRC
+        if ioc_type is None:
+            ioc_type = IoCType.IP
+        return Attacker(direction=direction, ioc_type=ioc_type, value=value)
+
+    def create_victim_obj(
+        self,
+        value="192.168.1.2",
+        direction=None,
+        ioc_type=None,
+    ):
+        from slips_files.core.structures.evidence import (
+            Direction,
+            IoCType,
+            Victim,
+        )
+
+        if direction is None:
+            direction = Direction.DST
+        if ioc_type is None:
+            ioc_type = IoCType.IP
+        return Victim(direction=direction, ioc_type=ioc_type, value=value)
+
+    def create_profileid_obj(self, ip="192.168.1.3"):
+        from slips_files.core.structures.evidence import ProfileID
+
+        return ProfileID(ip=ip)
+
+    def create_timewindow_obj(self, number=1):
+        from slips_files.core.structures.evidence import TimeWindow
+
+        return TimeWindow(number=number)
+
+    def create_proto_obj(self):
+        from slips_files.core.structures.evidence import Proto
+
+        return Proto
+
+    def create_evidence_obj(
+        self,
+        evidence_type,
+        description,
+        attacker,
+        threat_level,
+        victim,
+        profile,
+        timewindow,
+        uid,
+        timestamp,
+        proto,
+        dst_port,
+        id,
+        confidence,
+    ):
+        from slips_files.core.structures.evidence import Evidence
+
+        return Evidence(
+            evidence_type=evidence_type,
+            description=description,
+            attacker=attacker,
+            threat_level=threat_level,
+            victim=victim,
+            profile=profile,
+            timewindow=timewindow,
+            uid=uid,
+            timestamp=timestamp,
+            proto=proto,
+            dst_port=dst_port,
+            id=id,
+            confidence=confidence,
+        )
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_network_discovery_obj(self, mock_db):
+        from modules.network_discovery.network_discovery import (
+            NetworkDiscovery,
+        )
+
+        network_discovery = NetworkDiscovery(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        return network_discovery
+
+    def create_markov_chain_obj(self):
+        from slips_files.common.markov_chains import Matrix
+
+        return Matrix()
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_arp_poisoner_obj(self, mock_db):
+        from modules.arp_poisoner.arp_poisoner import ARPPoisoner
+
+        poisoner = ARPPoisoner(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        return poisoner
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_evidence_handler_obj(self, mock_db):
+        from slips_files.core.evidence_handler import EvidenceHandler
+
+        with patch(
+            "slips_files.core.evidence_handler.Notify",
+            return_value=Mock(enabled=True),
+        ):
+            handler = EvidenceHandler(
+                logger=Mock(),
+                output_dir="/tmp",
+                redis_port=6379,
+                termination_event=Mock(),
+                slips_args=Mock(),
+                conf=Mock(),
+                ppid=Mock(),
+                bloom_filters_manager=Mock(),
+            )
+        handler.db = mock_db
+        return handler
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_evidence_handler_worker_obj(self, mock_db):
+        from slips_files.core.evidence_handler_worker import (
+            EvidenceHandlerWorker,
+        )
+
+        def fake_read_configuration(worker):
+            worker.width = 3600
+            worker.detection_threshold = 0.25
+            worker.risk_accumulated_threat_level_threshold = 15
+            worker.use_p2p = False
+            worker.exporting_modules_enabled = False
+            worker.generate_performance_plots = False
+
+        with (
+            patch(
+                "slips_files.core.evidence_handler_worker.Whitelist",
+                return_value=Mock(),
+            ),
+            patch(
+                "slips_files.core.evidence_handler_worker.IDMEFv2",
+                return_value=Mock(),
+            ),
+            patch(
+                "slips_files.core.evidence_handler_worker."
+                "EvidenceHandlerWorker.read_configuration",
+                new=fake_read_configuration,
+            ),
+            patch(
+                "slips_files.core.evidence_handler_worker.utils.get_own_ips",
+                return_value=[],
+            ),
+        ):
+            worker = EvidenceHandlerWorker(
+                logger=self.logger,
+                output_dir="/tmp",
+                redis_port=6379,
+                termination_event=Mock(),
+                slips_args=Mock(),
+                conf=Mock(),
+                ppid=Mock(),
+                bloom_filters_manager=Mock(),
+                name="evidence_handler_worker_process_0",
+                evidence_queue=Mock(),
+                evidence_logger_q=Mock(),
+                notify=None,
+            )
+
+        worker.db = mock_db
+        worker.print = Mock()
+        worker.conf.disabled_detections = Mock(return_value=[])
+        return worker
+
+    def create_evidence_loggr_obj(self):
+        from slips_files.core.evidence_logger import EvidenceLogger
+
+        conf = Mock()
+        conf.get_GID = Mock(return_value=0)
+        conf.get_UID = Mock(return_value=0)
+        conf.generate_performance_plots = Mock(return_value=False)
+
+        logfile = Mock()
+        logfile.name = "alerts.log"
+        jsonfile = Mock()
+        jsonfile.name = "alerts.json"
+
+        with (
+            patch(
+                "slips_files.core.evidence_logger.ConfigParser",
+                return_value=conf,
+            ),
+            patch(
+                "slips_files.core.evidence_logger.utils.change_logfiles_ownership"
+            ),
+            patch.object(
+                EvidenceLogger,
+                "clean_file",
+                side_effect=[logfile, jsonfile],
+            ),
+        ):
+            handler = EvidenceLogger(
+                logger_stop_signal=Mock(),
+                evidence_logger_q=Mock(),
+                output_dir="/tmp",
+            )
+        return handler
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_cesnet_obj(self, mock_db):
+        from modules.cesnet.cesnet import CESNET
+
+        output_dir = "dummy_output_dir"
+        redis_port = 6379
+        cesnet = CESNET(
+            self.logger,
+            output_dir,
+            redis_port,
+            Mock(),  # termination event
+            Mock(),  # args
+            Mock(),  # conf
+            Mock(),  # ppid
+            Mock(),  # Bloom filter manager
+        )
+        cesnet.db = mock_db
+        cesnet.wclient = MagicMock()
+        cesnet.node_info = [
+            {"Name": "TestNode", "Type": ["IPS"], "SW": ["Slips"]}
+        ]
+
+        cesnet.print = MagicMock()
+        return cesnet
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_evidence_formatter_obj(self, mock_db):
+        from slips_files.core.text_formatters.evidence_formatter import (
+            EvidenceFormatter,
+        )
+
+        args = Mock()
+        return EvidenceFormatter(mock_db, args)
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_symbol_handler_obj(self, mock_db):
+        from slips_files.core.helpers.symbols_handler import SymbolHandler
+
+        mock_logger = Mock()
+        mock_db.get_t2_for_profile_tw.return_value = (1000.0, 2000.0)
+        return SymbolHandler(mock_logger, mock_db)
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_riskiq_obj(self, mock_db):
+        from modules.risk_iq.risk_iq import RiskIQ
+
+        risk_iq = RiskIQ(
+            logger=self.logger,
+            output_dir="dummy_output_dir",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        risk_iq.db = mock_db
+        return risk_iq
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_timeline_object(self, mock_db):
+        from modules.timeline.timeline import Timeline
+
+        logger = Mock()
+        output_dir = "/tmp"
+        redis_port = 6379
+        tl = Timeline(
+            logger=logger,
+            output_dir=output_dir,
+            redis_port=redis_port,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=Mock(),
+            ppid=Mock(),
+            bloom_filters_manager=Mock(),
+        )
+        tl.db = mock_db
+        return tl
+
+    def create_alert_handler_obj(self):
+        from slips_files.core.database.redis_db.alert_handler import (
+            AlertHandler,
+        )
+        from slips_files.core.database.redis_db.constants import Constants
+
+        alert_handler = AlertHandler()
+        alert_handler.conf = Mock()
+        alert_handler.conf.disabled_detections = Mock(return_value=[])
+        alert_handler.constants = Constants()
+        alert_handler.default_ttl = 3600
+        alert_handler.extended_ttl = 3600
+        alert_handler.default_evidence_signal = "PAMP"
+        alert_handler.evidence_signal_overrides = {
+            "ANOMALOUS_FLOW": "DAMP",
+            "MALICIOUS_FLOW": "DAMP",
+        }
+        alert_handler.set_profileid_field = Mock()
+        return alert_handler
+
+    def create_profile_handler_obj(self):
+        from slips_files.core.database.redis_db.constants import Constants
+        from slips_files.core.database.redis_db.profile_handler import (
+            ProfileHandler,
+        )
+
+        handler = ProfileHandler()
+        handler.constants = Constants()
+        handler.r = Mock()
+        handler.rcache = Mock()
+        handler.separator = "_"
+        handler.width = 3600
+        handler.default_ttl = 3600
+        handler.extended_ttl = 3600
+        handler.zadd_but_keep_n_entries = Mock()
+        handler.print = Mock()
+        handler.starttime_of_first_tw = None
+        handler.publish = Mock()
+        return handler
+
+    def create_scan_detections_db(self):
+        from slips_files.core.database.redis_db.constants import Constants
+        from slips_files.core.database.redis_db.scan_detections_db import (
+            ScanDetectionsHandler,
+        )
+
+        handler = ScanDetectionsHandler()
+        handler.constants = Constants()
+        handler.r = Mock()
+        handler.rcache = Mock()
+        handler.separator = "_"
+        handler.width = 3600
+        handler.print = Mock()
+        return handler
+
+    def create_process_manager_obj(self):
+        from managers.process_manager.process_manager import ProcessManager
+
+        main_mock = Mock()
+        # main_mock.conf.get_bootstrapping_setting.return_value = (False, [])
+        main_mock.conf.read_configuration.side_effect = (
+            lambda section, name, default_value: default_value
+        )
+        main_mock.conf.get_bootstrapping_modules.return_value = [
+            "fides",
+            "iris",
+        ]
+        main_mock.conf.export_to.return_value = []
+        main_mock.conf.use_local_p2p.return_value = False
+        main_mock.conf.use_global_p2p.return_value = False
+        main_mock.conf.send_to_warden.return_value = False
+        main_mock.conf.receive_from_warden.return_value = False
+        main_mock.conf.generate_performance_plots.return_value = False
+        main_mock.conf.llm_enabled.return_value = True
+        main_mock.conf.llm_backends.return_value = {
+            "local_qwen": {
+                "provider": "ollama",
+                "model": "qwen2.5:3b",
+            }
+        }
+        main_mock.conf.alert_summary_enabled.return_value = False
+        main_mock.conf.regex_generator_enabled.return_value = False
+        main_mock.conf.t_cell_enabled.return_value = False
+        main_mock.input_type = InputType.PCAP
+        main_mock.mode = "normal"
+        main_mock.stdout = ""
+        main_mock.args = Mock(growing=False, input_module=False, testing=False)
+        return ProcessManager(main_mock)
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_metadata_manager_obj(self, mock_db):
+        from managers.metadata_manager import MetadataManager
+
+        main = self.create_main_obj()
+        metadata_manager = MetadataManager(main)
+
+        mock_attributes = {
+            "db": mock_db,
+            "print": MagicMock(),
+            "args": MagicMock(
+                output="/tmp/output",
+                config="config/slips.yaml",
+                filepath=MagicMock(),
+            ),
+            "conf": MagicMock(
+                enable_metadata=MagicMock(return_value=True),
+                whitelist_path=MagicMock(
+                    return_value="/path/to/whitelist.conf"
+                ),
+                export_to=MagicMock(return_value=[]),
+                use_local_p2p=MagicMock(return_value=False),
+                use_global_p2p=MagicMock(return_value=False),
+                send_to_warden=MagicMock(return_value=False),
+                receive_from_warden=MagicMock(return_value=False),
+                read_configuration=MagicMock(
+                    side_effect=(
+                        lambda section, name, default_value: default_value
+                    )
+                ),
+                evidence_detection_threshold=MagicMock(return_value=0.5),
+            ),
+            "version": "1.0",
+            "input_information": "test_input",
+            "input_type": MagicMock(),
+            "zeek_dir": MagicMock(),
+        }
+
+        for attr, value in mock_attributes.items():
+            setattr(metadata_manager.main, attr, value)
+
+        return metadata_manager
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_rnn_detection_object(self, mock_db):
+        from modules.rnn_cc_detection.rnn_cc_detection import CCDetection
+
+        logger = Mock()
+        output_dir = "/tmp"
+        with patch.object(CCDetection, "__init__", return_value=None):
+            cc_detection = CCDetection(
+                logger,
+                output_dir,
+                6379,
+                Mock(),  # termination event
+                Mock(),  # args
+            )
+            cc_detection.db = mock_db
+            cc_detection.letters_exporter = Mock()
+            return cc_detection
+
+    @patch(MODULE_DB_MANAGER, name="mock_db")
+    def create_web_interface_obj(self, mock_db: Mock) -> object:
+        """
+        Create a web interface module with isolated runtime dependencies.
+
+        Parameters:
+            mock_db: Patched database manager supplied by unittest.mock.
+
+        Returns:
+            Web interface module instance.
+        """
+        from modules.web_interface.web_interface import WebInterface
+
+        conf = Mock()
+        conf.web_interface_port = 55000
+        module = WebInterface(
+            logger=self.logger,
+            output_dir="output",
+            redis_port=6379,
+            termination_event=Mock(),
+            slips_args=Mock(),
+            conf=conf,
+            ppid=12345,
+            bloom_filters_manager=Mock(),
+        )
+        module.print = Mock()
+        return module

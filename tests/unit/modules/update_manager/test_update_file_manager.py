@@ -1,0 +1,1154 @@
+# SPDX-FileCopyrightText: 2021 Sebastian Garcia <sebastian.garcia@agents.fel.cvut.cz>
+# SPDX-License-Identifier: GPL-2.0-only
+"""Unit test for modules/feeds_update_manager/feeds_update_manager.py"""
+
+import asyncio
+import json
+import threading
+import time
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, Mock, mock_open, patch
+
+import pytest
+import requests
+from pytest_mock.plugin import MockerFixture
+
+from slips_files.common.timer_manager import PeriodicUpdateTimer
+from tests.common_test_utils import get_mock_coro
+from tests.module_factory import ModuleFactory
+
+
+def test_check_if_update_based_on_update_period():
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.db.get_ti_feed_info.return_value = {"time": float("inf")}
+    url = "abc.com/x"
+    # update period hasn't passed
+    assert update_manager.should_update(url, float("inf")) is False
+
+
+def test_check_if_update_based_on_e_tag(mocker):
+    update_manager = ModuleFactory().create_update_manager_obj()
+
+    # period passed, etag same
+    etag = "1234"
+    url = "google.com/images"
+    update_manager.db.get_ti_feed_info.return_value = {"e-tag": etag}
+
+    mock_requests = mocker.patch("requests.get")
+    mock_requests.return_value.status_code = 200
+    mock_requests.return_value.headers = {"ETag": "1234"}
+    mock_requests.return_value.text = ""
+    assert update_manager.should_update(url, float("-inf")) is False
+
+    # period passed, etag different
+    etag = "1111"
+    url = "google.com/images"
+    update_manager.db.get_ti_feed_info.return_value = {"e-tag": etag}
+    mock_requests = mocker.patch("requests.get")
+    mock_requests.return_value.status_code = 200
+    mock_requests.return_value.headers = {"ETag": "2222"}
+    mock_requests.return_value.text = ""
+    assert update_manager.should_update(url, float("-inf")) is True
+    # only the headers were needed, the body is never read or kept
+    mock_requests.return_value.close.assert_called()
+    assert update_manager.responses == {}
+
+
+def test_check_if_update_based_on_last_modified(
+    mocker,
+):
+    update_manager = ModuleFactory().create_update_manager_obj()
+
+    # period passed, no etag, last modified the same
+    url = "google.com/photos"
+
+    update_manager.db.get_ti_feed_info.return_value = {"Last-Modified": 10.0}
+    mock_requests = mocker.patch("requests.get")
+    mock_requests.return_value.status_code = 200
+    mock_requests.return_value.headers = {"Last-Modified": 10.0}
+    mock_requests.return_value.text = ""
+
+    assert update_manager.should_update(url, float("-inf")) is False
+
+    # period passed, no etag, last modified changed
+    url = "google.com/photos"
+
+    update_manager.db.get_ti_feed_info.return_value = {"Last-Modified": 10}
+    mock_requests = mocker.patch("requests.get")
+    mock_requests.return_value.status_code = 200
+    mock_requests.return_value.headers = {"Last-Modified": 11}
+    mock_requests.return_value.text = ""
+
+    assert update_manager.should_update(url, float("-inf")) is True
+
+
+def test_should_update_records_attempt_when_feed_is_unreachable(mocker):
+    """A feed that fails to download should still have its last-update
+    time recorded, so it isn't retried on every single slips run until
+    the update period passes again."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    url = "https://example.com/unreachable.txt"
+    update_manager.db.get_ti_feed_info.return_value = {}
+    mocker.patch(
+        "requests.get", side_effect=requests.exceptions.ConnectionError
+    )
+
+    assert update_manager.should_update(url, float("-inf")) is False
+    update_manager.db.set_feed_last_update_time.assert_called_once()
+    assert update_manager.db.set_feed_last_update_time.call_args[0][0] == url
+
+
+@pytest.mark.parametrize(
+    "new_hash, old_hash, expected_result",
+    [  # Testcase1: File not in DB, update needed
+        ("hash123", False, True),
+        # Testcase2: Hashes match, no update needed
+        ("hash456", "hash456", False),
+        # Testcase3: Hashes different, update needed
+        ("hash789", "hash123", True),
+    ],
+)
+def test_check_if_update_local_file(
+    mocker, new_hash, old_hash, expected_result
+):
+    """
+    Test if check_if_update_local_file() correctly detects
+    if we should update a local file based on the file hash.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+
+    mocker.patch(
+        "slips_files.common.slips_utils.Utils.get_sha256_hash_of_file_contents",
+        return_value=new_hash,
+    )
+    update_manager.db.get_ti_feed_info.return_value = {"hash": old_hash}
+
+    file_path = "path/to/my/file.txt"
+    assert (
+        update_manager.check_if_update_local_file(file_path) is expected_result
+    )
+
+
+@pytest.mark.parametrize(
+    "mock_data, expected_feeds",
+    [
+        # Testcase1: Valid file with multiple feeds and tags.
+        (
+            "https://example.com/feed1.txt,"
+            "medium,tag1,tag2\nhttps://example.com/feed2.txt,high,tag3",
+            {
+                "https://example.com/feed1.txt": {
+                    "tags": ["tag1 tag2"],
+                    "threat_level": "medium",
+                },
+                "https://example.com/feed2.txt": {
+                    "tags": ["tag3"],
+                    "threat_level": "high",
+                },
+            },
+        ),
+        # Testcase2: File with comments and invalid threat level.
+        (
+            "# This is a comment\nhttps://example.com/feed3.txt,"
+            "invalid,tag4\nhttps://example.com/feed4.txt,low,tag5",
+            {
+                "https://example.com/feed3.txt": {
+                    "tags": ["tag4"],
+                    "threat_level": "low",
+                },
+                "https://example.com/feed4.txt": {
+                    "tags": ["tag5"],
+                    "threat_level": "low",
+                },
+            },
+        ),
+        # Testcase3: Empty file.
+        ("", {}),
+    ],
+)
+def test_get_feed_details(mocker, mock_data, expected_feeds):
+    """Test get_feed_details with different file contents."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    mock_feeds_file = mock_open(read_data=mock_data)
+    mocker.patch("builtins.open", mock_feeds_file)
+    feeds = update_manager.get_feed_details("path/to/feeds")
+    assert feeds == expected_feeds
+
+
+@pytest.mark.parametrize(
+    "feeds_path",
+    [
+        # ti_files()/ja3_feeds()/ssl_feeds() return False when unconfigured.
+        False,
+        None,
+        "",
+    ],
+)
+def test_get_feed_details_with_unconfigured_path(mocker, feeds_path):
+    """
+    open() accepts a bool/int as a raw file descriptor instead of raising,
+    so an unconfigured feeds_path (False/None/"") must short-circuit before
+    reaching open() -- otherwise False opens stdin (fd 0) and can hang
+    forever reading it.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    mock_open_call = mocker.patch("builtins.open")
+    feeds = update_manager.get_feed_details(feeds_path)
+    assert feeds == {}
+    mock_open_call.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Testcase1: Log a simple message.
+        ("Test message"),
+        # Testcase2: Log an empty message.
+        (""),
+    ],
+)
+def test_log(message):
+    """Test the log function with different message types."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.print = Mock()
+    update_manager.log(message)
+    update_manager.print.assert_called_once_with(
+        message, verbose=0, debug=1, log_to_logfiles_only=True
+    )
+
+
+def test_download_file(
+    mocker,
+):
+    """Test download_file with a successful request."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    url = "https://example.com/file.txt"
+    mock_requests = mocker.patch("requests.get")
+    mock_requests.return_value.status_code = 200
+    mock_requests.return_value.text = "file content"
+    response = update_manager.download_file(url)
+
+    mock_requests.assert_called_once_with(url, timeout=5, stream=True)
+    assert response.text == "file content"
+
+
+@pytest.mark.parametrize(
+    "request_failure",
+    [
+        requests.exceptions.ReadTimeout,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ChunkedEncodingError,
+    ],
+)
+def test_download_file_logs_transient_failures_as_warnings(
+    mocker: MockerFixture,
+    request_failure: type[requests.exceptions.RequestException],
+) -> None:
+    """Test transient feed download failures are not logged as errors.
+
+    Parameters:
+        request_failure: Request exception raised by the mocked download.
+
+    Return:
+        None.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.print = Mock()
+    url = "https://example.com/file.txt"
+    mock_requests = mocker.patch("requests.get", side_effect=request_failure)
+
+    assert update_manager.download_file(url) is False
+    assert mock_requests.call_count == 5
+    update_manager.print.assert_called_once()
+    _, verbose, debug = update_manager.print.call_args.args
+    assert verbose == 1
+    assert debug == 0
+
+
+@pytest.mark.parametrize(
+    "test_data, expected_calls",
+    [
+        # Testcase1: Valid file with single and range ports.
+        (
+            """"Organization","IP","Ports Range","Protocol"
+TestOrg,192.168.1.1,80,tcp
+TestOrg,192.168.1.2,443-445,udp""",
+            [
+                ("TestOrg", "192.168.1.1", "80/tcp"),
+                ("TestOrg", "192.168.1.2", "443/udp"),
+                ("TestOrg", "192.168.1.2", "444/udp"),
+                ("TestOrg", "192.168.1.2", "445/udp"),
+            ],
+        ),
+        # Testcase2: File with invalid line format.
+        (
+            """"Organization","IP","Ports Range","Protocol"
+TestOrg,192.168.1.1,80
+TestOrg,192.168.1.2,443-445,udp""",
+            [
+                ("TestOrg", "192.168.1.2", "443/udp"),
+                ("TestOrg", "192.168.1.2", "444/udp"),
+                ("TestOrg", "192.168.1.2", "445/udp"),
+            ],
+        ),
+        # Testcase3: Empty file.
+        (
+            "",
+            [],
+        ),
+    ],
+)
+def test_read_ports_info(mocker, tmp_path, test_data, expected_calls):
+    """Test read_ports_info with different file contents."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    mocker.patch("builtins.open", mock_open(read_data=test_data))
+    update_manager.read_ports_info(str(tmp_path / "ports_info.csv"))
+    update_manager.db.set_organizations_of_ports.assert_called_once_with(
+        expected_calls
+    )
+
+
+@pytest.mark.parametrize(
+    "test_data, file_name, expected_db_call",
+    [
+        # Testcase1: Update ports_used_by_specific_orgs.csv.
+        (
+            """Organization,IP,Ports Range,Protocol
+            TestOrg,192.168.1.1,80,tcp
+            TestOrg,192.168.1.2,443-445,udp""",
+            "ports_used_by_specific_orgs.csv",
+            "set_organization_of_port",
+        ),
+        # Testcase2: Update services.csv.
+        (
+            """ssh,22,tcp
+            http,80,tcp""",
+            "services.csv",
+            "set_port_info",
+        ),
+    ],
+)
+def test_update_local_file(
+    mocker, tmp_path, test_data, file_name, expected_db_call
+):
+    """Test update_local_file with a valid file."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.new_hash = "test_hash"
+    mocker.patch("builtins.open", mock_open(read_data=test_data))
+    now = 1678887000.0
+    with patch("time.time", return_value=now):
+        result = update_manager.update_local_file(str(tmp_path / file_name))
+    update_manager.db.set_ti_feed_info.assert_called_once_with(
+        str(tmp_path / file_name), {"hash": "test_hash", "time": now}
+    )
+    assert result is True
+
+
+def test_check_if_update_online_whitelist_download_updated():
+    """Update period passed, download succeeds."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.download_file = Mock()
+    update_manager.db.get_ti_feed_info.return_value = {"time": 0}
+    update_manager.online_whitelist = "https://example.com/whitelist.txt"
+
+    update_manager.download_file = Mock(return_value=Mock(status_code=200))
+
+    result = update_manager.should_update_online_whitelist()
+
+    assert result is True
+    update_manager.download_file.assert_called_once_with(
+        update_manager.online_whitelist
+    )
+    assert "tranco_whitelist" in update_manager.responses
+
+
+def test_check_if_update_online_whitelist_not_updated():
+    """Update period hasn't passed - no update needed."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.online_whitelist = "https://example.com/whitelist.txt"
+    update_manager.db.get_ti_feed_info.return_value = {"time": time.time()}
+    result = update_manager.should_update_online_whitelist()
+    assert result is False
+    update_manager.db.set_ti_feed_info.assert_not_called()
+
+
+def test_update_online_whitelist_stores_ordered_valid_tranco_rows():
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.online_whitelist_update_period = 86400
+    lines = [
+        "1,Example.com",
+        "2,google.com",
+        "3,github.com",
+        "4,google.com",
+        "bad-line",
+        "5,localhost",
+    ]
+    response = MagicMock()
+    response.iter_lines.return_value = [line.encode() for line in lines]
+    update_manager.responses["tranco_whitelist"] = response
+
+    update_manager._update_online_whitelist()
+
+    update_manager.db.store_tranco_whitelisted_domains.assert_called_once_with(
+        ["example.com", "google.com", "github.com", "google.com"]
+    )
+    assert "tranco_whitelist" not in update_manager.responses
+
+
+@pytest.mark.parametrize(
+    "headers, expected_last_modified",
+    [
+        # Testcase1: Header has Last-Modified field.
+        (
+            {"Last-Modified": "Wed, 21 Oct 2015 07:28:00 GMT"},
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+        ),
+        # Testcase2: Header doesn't have Last-Modified field.
+        ({}, False),
+    ],
+)
+def test_get_last_modified(mocker, headers, expected_last_modified):
+    """
+    Test get_last_modified() with different scenarios:
+    """
+    mock_response = mocker.Mock()
+    mock_response.headers = headers
+    update_manager = ModuleFactory().create_update_manager_obj()
+    assert (
+        update_manager.get_last_modified(mock_response)
+        == expected_last_modified
+    )
+
+
+@pytest.mark.parametrize(
+    "headers, expected_etag",
+    [
+        # Testcase1: Header has ETag field.
+        (
+            {"ETag": '"33a64df551425fcc55e4d42a148795d9f25f89d4"'},
+            '"33a64df551425fcc55e4d42a148795d9f25f89d4"',
+        ),
+        # Testcase2: Header doesn't have ETag field.
+        ({}, False),
+    ],
+)
+def test_get_e_tag(mocker, headers, expected_etag):
+    """
+    Test get_e_tag() with different scenarios:
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    mock_response = mocker.Mock()
+    mock_response.headers = headers
+    assert update_manager.get_e_tag(mock_response) == expected_etag
+
+
+def test_write_file_to_disk(mocker, tmp_path):
+    """
+    Test write_file_to_disk() by writing content to a temporary file.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    mock_response = MagicMock()
+    mock_response.iter_content.return_value = [b"test ", b"content"]
+    file_path = tmp_path / "test_file.txt"
+
+    update_manager.write_file_to_disk(mock_response, file_path)
+
+    with open(file_path, "r") as f:
+        assert f.read() == "test content"
+    mock_response.__exit__.assert_called_once()
+
+
+def test_write_file_to_disk_removes_partial_file_on_failure(tmp_path):
+    update_manager = ModuleFactory().create_update_manager_obj()
+
+    def broken_stream(chunk_size):
+        yield b"partial"
+        raise requests.exceptions.ChunkedEncodingError
+
+    mock_response = MagicMock()
+    mock_response.iter_content.side_effect = broken_stream
+    file_path = tmp_path / "test_file.txt"
+
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        update_manager.write_file_to_disk(mock_response, file_path)
+
+    assert not file_path.exists()
+
+
+def test_update_riskiq_feed(
+    mocker,
+):
+    """
+    Test update_riskiq_feed with a
+    successful request and valid data.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.riskiq_email = "test@example.com"
+    update_manager.riskiq_key = "test_key"
+    mock_response = mocker.Mock()
+    mock_response.json.return_value = {
+        "indicators": [
+            {"type": "domain", "value": "malicious.com"},
+        ]
+    }
+    mocker.patch("requests.get", return_value=mock_response)
+    result = update_manager.update_riskiq_feed()
+    update_manager.db.add_domains_to_ioc.assert_called_once_with(
+        {
+            "malicious.com": json.dumps(
+                {
+                    "description": "malicious domain detected by RiskIQ",
+                    "source": "https://api.riskiq.net/pt/v2/articles/indicators",
+                }
+            )
+        }
+    )
+    update_manager.db.set_ti_feed_info.assert_called_once_with(
+        "riskiq_domains", {"time": mocker.ANY}
+    )
+    assert result is True
+
+
+def test_update_riskiq_feed_invalid_api_key(
+    mocker,
+):
+    """
+    Test when RiskIQ API returns an error (e.g., invalid API key)
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.riskiq_email = "test@example.com"
+    update_manager.riskiq_key = "invalid_key"
+    mock_response = mocker.Mock()
+    mock_response.json.return_value = {"message": "Invalid API key"}
+    mocker.patch("requests.get", return_value=mock_response)
+
+    result = update_manager.update_riskiq_feed()
+    assert result is False
+    update_manager.db.add_domains_to_ioc.assert_not_called()
+    update_manager.db.set_ti_feed_info.assert_not_called()
+
+
+def test_update_riskiq_feed_request_exception(
+    mocker,
+):
+    """Test when there's an error during the request to RiskIQ."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.riskiq_email = "test@example.com"
+    update_manager.riskiq_key = "test_key"
+    mocker.patch(
+        "requests.get",
+        side_effect=requests.exceptions.RequestException("Connection error"),
+    )
+
+    result = update_manager.update_riskiq_feed()
+    assert result is False
+    update_manager.db.add_domains_to_ioc.assert_not_called()
+    update_manager.db.set_ti_feed_info.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "header, expected_description_column",
+    [
+        # Testcase1: finding "desc" column
+        ("#,ip,desc", 2),
+        # Testcase2: finding "collect" column
+        ("#,ip,collect", 2),
+        # Testcase3: not finding a description column
+        ("#,ip,date", None),
+    ],
+)
+def test_get_description_column_index(header, expected_description_column):
+    """
+    Test get_description_column() with different header formats.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    description_column = update_manager.get_description_column_index(header)
+    assert description_column == expected_description_column
+
+
+@pytest.mark.parametrize(
+    "line, expected_result",
+    [  # Testcase1:comment line
+        ("# This is a comment", True),
+        # Testcase2:blank line
+        ("", True),
+        # Testcase3:line with unsupported IoC type
+        ("email,test@example.com", True),
+        # Testcase4:line with header keyword
+        ("type,ip", True),
+        # Testcase5:valid line
+        ("1.2.3.4,Test description", None),
+    ],
+)
+def test_is_ignored_line(line, expected_result):
+    """
+    Test is_ignored_line() with different line types.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    assert update_manager.is_ignored_line(line) is expected_result
+
+
+@pytest.mark.parametrize(
+    "line, expected_amount_of_columns, expected_line_fields, expected_sep",
+    [
+        # Testcase1:comma-separated line
+        ("1.2.3.4,Test description", 2, ["1.2.3.4", "Test description"], ","),
+        # Testcase2:tab-separated line
+        (
+            "1.2.3.4\tTest description",
+            2,
+            ["1.2.3.4", "Test description"],
+            "\t",
+        ),
+        # Testcase3:space-separated line
+        ("1.2.3.4 Test description", 1, ["1.2.3.4 Test description"], "\t"),
+    ],
+)
+def test_parse_line(
+    line, expected_amount_of_columns, expected_line_fields, expected_sep
+):
+    """
+    Test parse_line() with different line formats.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    amount_of_columns, line_fields, sep = (
+        update_manager.get_feed_fields_and_sep(line, "")
+    )
+    assert amount_of_columns == expected_amount_of_columns
+    assert line_fields == expected_line_fields
+    assert sep == expected_sep
+
+
+@pytest.mark.parametrize(
+    "line_fields, expected_data_column",
+    [  # Testcase1:Valid IP
+        (["1.2.3.4", "Test description"], 0),
+        # Testcase2:Valid domain
+        (["example.com", "Test description"], 0),
+        # Testcase3:Invalid data
+        (["invalid_data", "Test description"], "Error"),
+    ],
+)
+def test_get_data_column(line_fields, expected_data_column):
+    """
+    Test get_data_column with different input scenarios:
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    amount_of_columns = 2
+    file_path = "test_file.txt"
+    data_column = update_manager.get_data_column(
+        amount_of_columns, line_fields, file_path
+    )
+    assert data_column == expected_data_column
+
+
+@pytest.mark.parametrize(
+    "line, line_fields, separator, data_column, "
+    "description_column, file_path, "
+    "expected_data, expected_description",
+    [
+        (
+            "1.2.3.4,Test description",
+            ["1.2.3.4", "Test description"],
+            ",",
+            0,
+            1,
+            "test_file.txt",
+            "1.2.3.4",
+            "Test description",
+        ),
+        (
+            "example.com,Test description",
+            ["example.com", "Test description"],
+            ",",
+            0,
+            1,
+            "test_file.txt",
+            "example.com",
+            "Test description",
+        ),
+        (
+            "1.2.3.4",
+            ["1.2.3.4"],
+            ",",
+            0,
+            1,
+            "test_file.txt",
+            False,
+            False,
+        ),
+    ],
+)
+def test_extract_ioc_from_line(
+    line,
+    line_fields,
+    separator,
+    data_column,
+    description_column,
+    file_path,
+    expected_data,
+    expected_description,
+):
+    """
+    Test extract_ioc_from_line with different scenarios:
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    data, description = update_manager.extract_ioc_from_line(
+        line,
+        line_fields,
+        separator,
+        data_column,
+        description_column,
+        file_path,
+    )
+    assert data == expected_data
+    assert description == expected_description
+
+
+@patch("os.path.getsize", return_value=10)
+def test_parse_ti_feed_valid_data(
+    mocker,
+):
+    """
+    Test parse_ti_feed with valid data
+    containing both IP and domain.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.url_feeds = {
+        "https://example.com/test.txt": {
+            "threat_level": "low",
+            "tags": ["tag3"],
+        }
+    }
+    test_data = """# Comment
+    1.2.3.4,Test description
+    example.com,Another description"""
+    with patch("builtins.open", mock_open(read_data=test_data)):
+        result = update_manager.parse_ti_feed(
+            "https://example.com/test.txt", "test.txt"
+        )
+    update_manager.db.add_ips_to_ioc.assert_any_call(
+        {
+            "1.2.3.4": '{"description": "Test description", '
+            '"source": "test.txt", '
+            '"threat_level": "low", '
+            '"tags": ["tag3"]}'
+        }
+    )
+    update_manager.db.add_domains_to_ioc.assert_any_call(
+        {
+            "example.com": '{"description": "Another description",'
+            ' "source": "test.txt",'
+            ' "threat_level": "low", '
+            '"tags": ["tag3"]}'
+        }
+    )
+    assert result is True
+
+
+def test_parse_ti_feed_invalid_data(mocker, tmp_path):
+    """Test parse_ti_feed with invalid data."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.url_feeds = {
+        "https://example.com/invalid.txt": {
+            "threat_level": "low",
+            "tags": ["tag3"],
+        }
+    }
+    test_data = """# Comment
+    invalid_data,Description
+    """
+    mocker.patch("builtins.open", mock_open(read_data=test_data))
+    result = update_manager.parse_ti_feed(
+        "https://example.com/invalid.txt", str(tmp_path / "invalid.txt")
+    )
+    update_manager.db.add_ips_to_ioc.assert_not_called()
+    update_manager.db.add_domains_to_ioc.assert_not_called()
+    assert result is False
+
+
+@pytest.mark.parametrize(
+    "file_content, cached_hash, expected_result",
+    [  # Testcase1: New file
+        ("test content", {}, True),
+        # Testcase2: Updated file
+        ("new content", "old_hash", True),
+    ],
+)
+def test_check_if_update_org(
+    mocker, file_content, cached_hash, expected_result
+):
+    """Test check_if_update_org with different file and cache scenarios."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+
+    update_manager.db.get_ti_feed_info.return_value = {"hash": cached_hash}
+    mocker.patch(
+        "slips_files.common."
+        "slips_utils.Utils.get_sha256_hash_of_file_contents",
+        return_value=hash(file_content.encode()),
+    )
+    result = update_manager.check_if_update_org("test_org")
+    assert result is expected_result
+
+
+@pytest.mark.parametrize(
+    "status_code, expected_result, db_call_count",
+    [  # Testcase1: Successful download and update
+        (200, True, 1),
+        # Testcase2: Download failed
+        (404, False, 0),
+        # Testcase3: Server error
+        (500, False, 0),
+    ],
+)
+def test_update_mac_db(tmp_path, status_code, expected_result, db_call_count):
+    """
+    Test update_mac_db with different response status codes.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.mac_db_link = "https://example.com/mac_db.json"
+    update_manager.path_to_mac_db = str(tmp_path / "mac_db.json")
+
+    mock_response = MagicMock()
+    mock_response.status_code = status_code
+    mock_response.iter_content.return_value = [
+        b'[{"mac":"00:00:00:00:00:01","vendor":"VendorA"},',
+        b'{"mac":"00:00:00:00:00:02","vendor":"VendorB"}]',
+    ]
+    update_manager.responses["mac_db"] = mock_response
+
+    result = update_manager.update_mac_db()
+
+    assert result is expected_result
+    assert update_manager.db.set_ti_feed_info.call_count == db_call_count
+    assert "mac_db" not in update_manager.responses
+    mock_response.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [b'[{"a":1},{"a":2},{"a":3}]'],
+        # the ",{" separator is split between 2 chunks
+        [b'[{"a":1},', b'{"a":2},{"a":3}]'],
+        [b'[{"a":1}', b',{"a":2}', b",", b'{"a":3}]'],
+    ],
+)
+def test_write_mac_db_streams_one_json_per_line(tmp_path, chunks):
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.path_to_mac_db = str(tmp_path / "mac_db.json")
+    response = MagicMock()
+    response.iter_content.return_value = chunks
+
+    update_manager._write_mac_db(response)
+
+    with open(update_manager.path_to_mac_db) as f:
+        assert f.read() == '{"a":1}\n{"a":2}\n{"a":3}'
+    assert not (tmp_path / "mac_db.json.tmp").exists()
+
+
+def test_write_mac_db_keeps_old_db_when_download_fails(tmp_path):
+    update_manager = ModuleFactory().create_update_manager_obj()
+    db_path = tmp_path / "mac_db.json"
+    db_path.write_text("old db")
+    update_manager.path_to_mac_db = str(db_path)
+
+    def broken_stream(chunk_size):
+        yield b'[{"a":1},'
+        raise requests.exceptions.ChunkedEncodingError
+
+    response = MagicMock()
+    response.iter_content.side_effect = broken_stream
+
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        update_manager._write_mac_db(response)
+
+    assert db_path.read_text() == "old db"
+    assert not (tmp_path / "mac_db.json.tmp").exists()
+
+
+def test_shutdown_gracefully(
+    mocker,
+):
+    """
+    Test shutdown_gracefully to ensure the update timer is canceled.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.update_timer = mocker.Mock()
+    result = update_manager.shutdown_gracefully()
+    update_manager.update_timer.cancel.assert_called_once()
+    assert result is True
+
+
+@pytest.mark.parametrize(
+    "periods, expected_due_times, expected_delay",
+    [
+        ((5, 10, 0), [15, 20], 5),
+        ((30,), [40], 30),
+    ],
+)
+def test_periodic_update_timer_schedules_next_due_time(
+    mocker,
+    periods,
+    expected_due_times,
+    expected_delay,
+):
+    """
+    Test PeriodicUpdateTimer schedules one timer for the nearest due time.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    mock_timer = mocker.Mock()
+    timer_factory = mocker.patch(
+        "slips_files.common.timer_manager.Timer",
+        return_value=mock_timer,
+    )
+    mocker.patch(
+        "slips_files.common.timer_manager.time.monotonic",
+        return_value=10,
+    )
+
+    timer = PeriodicUpdateTimer(periods, update_manager.update_ti_files)
+    timer.start()
+
+    assert timer.next_due_at == expected_due_times
+    timer_factory.assert_called_once_with(expected_delay, timer._handle_target)
+    mock_timer.start.assert_called_once()
+
+
+def test_parse_ssl_feed_valid_data(mocker, tmp_path):
+    """
+    Test parse_ssl_feed with valid data containing multiple SSL fingerprints.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.ssl_feeds = {
+        "https://example.com/test_ssl_feed.csv": {
+            "threat_level": "medium",
+            "tags": ["tag1", "tag2"],
+        }
+    }
+    test_data = """# Listingdate,SHA1 Fingerprint,Description
+    2023-03-08 07:58:29,6cec09bcb575352785d313c7e978f26bfbd528ab,AsyncRAT C&C
+    2023-03-09 08:00:00,aaabbbcccdddeeeeffff00001111222233334444,Cobalt Strike C2"""
+    mocker.patch("builtins.open", mock_open(read_data=test_data))
+    result = update_manager.parse_ssl_feed(
+        "https://example.com/test_ssl_feed.csv",
+        str(tmp_path / "test_ssl_feed.csv"),
+    )
+
+    update_manager.db.add_ssl_sha1_to_ioc.assert_called_once_with(
+        {
+            "aaabbbcccdddeeeeffff00001111222233334444": json.dumps(
+                {
+                    "description": "Cobalt Strike C2",
+                    "source": "test_ssl_feed.csv",
+                    "threat_level": "medium",
+                    "tags": ["tag1", "tag2"],
+                }
+            ),
+        }
+    )
+    assert result is True
+
+
+def test_parse_ssl_feed_no_valid_fingerprints(mocker, tmp_path):
+    """
+    Test parse_ssl_feed with a file that doesn't contain any valid SSL fingerprints.
+    """
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.ssl_feeds = {
+        "https://example.com/test_ssl_feed.csv": {
+            "threat_level": "medium",
+            "tags": ["tag1", "tag2"],
+        }
+    }
+    test_data = """# ja3_md5,first_seen,last_seen,Listingreason
+    8f52d1ce303fb4a6515836aec3cc16b1,
+    2017-07-15 19:05:11,2019-07-27 20:00:57,TrickBot"""
+    mocker.patch("builtins.open", mock_open(read_data=test_data))
+    result = update_manager.parse_ssl_feed(
+        "https://example.com/test_ssl_feed.csv",
+        str(tmp_path / "test_ssl_feed.csv"),
+    )
+
+    update_manager.db.add_ssl_sha1_to_ioc.assert_not_called()
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_update_checks_all_feeds_concurrently_and_awaits_all_tasks():
+    """should_update() should run for every feed (not stop at the first
+    one), and every update_ti_file() task it triggers should be awaited,
+    not just the last one scheduled."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.update_period = 3600
+    update_manager.url_feeds = {"https://example.com/feed1.txt": {}}
+    update_manager.ja3_feeds = {"https://example.com/feed2.txt": {}}
+    update_manager.ssl_feeds = {}
+    update_manager.tor_nodes_feeds = {"https://example.com/feed3.txt": {}}
+    update_manager.riskiq_update_period = 3600
+    update_manager._should_update_mac_db = Mock(return_value=False)
+    update_manager.should_update_online_whitelist = Mock(return_value=False)
+    update_manager._delete_unused_cached_remote_feeds = Mock()
+    update_manager.should_update = Mock(
+        side_effect=lambda feed, period: feed
+        != "https://example.com/feed2.txt"
+    )
+    update_manager.update_ti_file = get_mock_coro(None)
+    update_manager.db.set_loaded_ti_files = Mock()
+
+    await update_manager.update()
+
+    checked_feeds = {
+        call.args[0] for call in update_manager.should_update.call_args_list
+    }
+    assert checked_feeds == {
+        "https://example.com/feed1.txt",
+        "https://example.com/feed2.txt",
+        "https://example.com/feed3.txt",
+        "riskiq_domains",
+    }
+    update_manager.update_ti_file.assert_any_call(
+        "https://example.com/feed1.txt"
+    )
+    update_manager.update_ti_file.assert_any_call(
+        "https://example.com/feed3.txt"
+    )
+    assert update_manager.update_ti_file.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_update_stops_early_when_termination_requested():
+    """update() should stop waiting on outstanding should_update() checks
+    as soon as a shutdown is requested, instead of blocking until every
+    feed's (slow/network-bound) check has finished."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    update_manager.update_period = 3600
+    update_manager.url_feeds = {"https://example.com/feed1.txt": {}}
+    update_manager.ja3_feeds = {}
+    update_manager.ssl_feeds = {}
+    update_manager.tor_nodes_feeds = {}
+    update_manager.riskiq_update_period = 3600
+    update_manager._should_update_mac_db = Mock(return_value=False)
+    update_manager.should_update_online_whitelist = Mock(return_value=False)
+    update_manager._delete_unused_cached_remote_feeds = Mock()
+    # termination is already requested before update() is even called,
+    # so the termination watcher should win the race against the slow
+    # should_update() check below every time, deterministically.
+    update_manager.termination_event = threading.Event()
+    update_manager.termination_event.set()
+
+    def slow_should_update(feed, period):
+        time.sleep(1)
+        return True
+
+    update_manager.should_update = Mock(side_effect=slow_should_update)
+    update_manager.update_ti_file = get_mock_coro(None)
+    update_manager.db.set_loaded_ti_files = Mock()
+
+    result = await asyncio.wait_for(update_manager.update(), timeout=5)
+
+    assert result is False
+    # update() returned before any download was triggered
+    update_manager.update_ti_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_ti_file_runs_blocking_work_in_a_thread():
+    """update_ti_file() writes the feed to disk and parses it, both
+    blocking calls with no 'await' of their own. If that work ran
+    straight in the coroutine, every update_ti_file() task scheduled by
+    update() would run to completion one after the other instead of
+    overlapping, even though update() gathers them as concurrent tasks.
+    update_ti_file() must offload that work to a thread so multiple
+    feeds are actually processed at the same time."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    sleep_time = 0.2
+    call_threads = []
+
+    def slow_sync_update(link_to_download):
+        call_threads.append(threading.current_thread())
+        time.sleep(sleep_time)
+        return True
+
+    update_manager._update_ti_file_sync = Mock(side_effect=slow_sync_update)
+
+    start = time.time()
+    results = await asyncio.gather(
+        update_manager.update_ti_file("https://example.com/feed1.txt"),
+        update_manager.update_ti_file("https://example.com/feed2.txt"),
+        update_manager.update_ti_file("https://example.com/feed3.txt"),
+    )
+    elapsed = time.time() - start
+
+    assert results == [True, True, True]
+    assert update_manager._update_ti_file_sync.call_count == 3
+    # ran concurrently: far less than 3 * sleep_time (serial execution)
+    assert elapsed < sleep_time * 3
+    # the blocking work never ran on the event loop's own thread
+    assert threading.current_thread() not in call_threads
+
+
+CERT_PL_FEED = json.dumps(
+    [
+        {"DomainAddress": "new.example.pl", "InsertDate": "NEW_DATE"},
+        {
+            "DomainAddress": "old.example.pl",
+            "InsertDate": "2020-01-01T00:00:00+00:00",
+        },
+        {"DomainAddress": "not a domain", "InsertDate": "NEW_DATE"},
+    ],
+    indent=4,
+)
+
+
+def test_parse_cert_pl_json_feed_streams_and_keeps_recent_domains(tmp_path):
+    update_manager = ModuleFactory().create_update_manager_obj()
+    link = "https://hole.cert.pl/domains/domains.json"
+    update_manager.url_feeds = {
+        link: {"tags": ["phishing"], "threat_level": "medium"}
+    }
+    update_manager.max_days_to_keep_ti_files = 7
+    path = tmp_path / "domains.json"
+    now = datetime.now(timezone.utc).isoformat()
+    path.write_text(CERT_PL_FEED.replace("NEW_DATE", now))
+
+    assert update_manager._parse_json_ti_feed(link, str(path)) is True
+
+    stored = update_manager.db.add_domains_to_ioc.call_args.args[0]
+    assert list(stored) == ["new.example.pl"]
+
+
+def test_parse_cert_pl_json_feed_returns_false_on_invalid_json(tmp_path):
+    update_manager = ModuleFactory().create_update_manager_obj()
+    link = "https://hole.cert.pl/domains/domains.json"
+    update_manager.url_feeds = {link: {"tags": [], "threat_level": "medium"}}
+    path = tmp_path / "domains.json"
+    path.write_text("not json")
+
+    assert update_manager._parse_json_ti_feed(link, str(path)) is False
+    update_manager.db.add_domains_to_ioc.assert_not_called()
+
+
+def test_update_ti_file_downloads_body_only_when_updating(mocker, tmp_path):
+    """should_update() only reads headers. The body is streamed to disk
+    by update_ti_file() and never kept in self.responses."""
+    update_manager = ModuleFactory().create_update_manager_obj()
+    link = "https://example.com/feed.txt"
+    update_manager.path_to_remote_ti_files_dir = str(tmp_path)
+    update_manager.url_feeds = {link: {"tags": [], "threat_level": "low"}}
+    update_manager.ja3_feeds = {}
+    update_manager.ssl_feeds = {}
+    update_manager.tor_nodes_feed_link = ""
+    update_manager.parse_ti_feed = Mock(return_value=True)
+    response = MagicMock(status_code=200, headers={"ETag": "abc"})
+    response.iter_content.return_value = [b"1.2.3.4\n"]
+    update_manager.download_file = Mock(return_value=response)
+
+    assert update_manager._update_ti_file_sync(link) is True
+
+    update_manager.download_file.assert_called_once_with(link)
+    response.__exit__.assert_called_once()
+    assert update_manager.responses == {}
+    assert (
+        update_manager.db.set_ti_feed_info.call_args.args[1]["e-tag"] == "abc"
+    )

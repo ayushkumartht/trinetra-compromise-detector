@@ -1,0 +1,743 @@
+# SPDX-FileCopyrightText: 2021 Sebastian Garcia <sebastian.garcia@agents.fel.cvut.cz>
+# SPDX-License-Identifier: GPL-2.0-only
+import contextlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from distutils.dir_util import copy_tree
+from typing import Set
+import logging
+
+from managers.host_ip_manager import HostIPManager
+from managers.ap_manager import APManager
+from managers.metadata_manager import MetadataManager
+from managers.process_manager.process_manager import ProcessManager
+from managers.profilers_manager import ProfilersManager
+from managers.redis_manager import RedisManager
+from managers.timewindow_manager import TimewindowManager
+from managers.ui_manager import UIManager
+from modules.supported_module_names import Modules
+from slips_files.common.parsers.config_parser import ConfigParser
+from slips_files.common.performance_paths import get_performance_plots_dir
+from slips_files.common.printer import Printer
+from slips_files.common.sqlite_flock import SQLiteFlock
+from slips_files.common.slips_utils import utils
+from slips_files.common.style import (
+    green,
+    grey,
+    header_line,
+    print_separator,
+    yellow,
+)
+from slips_files.common.input_type import InputType
+from slips_files.core.database.database_manager import DBManager
+from slips_files.core.helpers.bloom_filters_manager import BFManager
+from slips_files.core.helpers.checker import Checker
+
+
+logging.basicConfig(level=logging.WARNING)
+
+DAEMONIZED_MODE = "daemonized"
+
+
+class Main:
+    def __init__(self, testing=False):
+        self.name = "main"
+        self.parent_output_dir = "output/"
+        self.mode = "interactive"
+        # objects to manage various functionality
+        self.checker = Checker(self)
+        self.redis_man = RedisManager(self)
+        self.conf = ConfigParser()
+        self.metadata_man = MetadataManager(self)
+        self.timewindow_man = TimewindowManager(self)
+        self.ui_man = UIManager(self)
+        self.version = utils.get_slips_version()
+        # will be filled later
+        self.commit = "None"
+        self.branch = "None"
+        self.last_updated_stats_time = datetime.now()
+        self.input_type = None
+        self.proc_man = ProcessManager(self)
+        self.gw_info_printed = False
+        self.localnet_info_printed = False
+        # in testing mode we manually set the following params
+        # TODO use mocks instead of this testing param
+        if not testing:
+            self.args = self.conf.get_args()
+            self.profilers_manager = ProfilersManager(self)
+            self.pid = os.getpid()
+            self.checker.verify_given_flags()
+            self.prepare_locks_dir()
+            if not self.args.stopdaemon:
+                self.input_type: InputType
+                (
+                    self.input_type,
+                    self.input_information,
+                    self.line_type,
+                ) = self.checker.get_input_type()
+                self.checker.verify_flags_that_require_an_interface(
+                    self.input_type
+                )
+                self.input_information = os.path.normpath(
+                    self.input_information
+                )
+                self.input_information = self.input_information.replace(
+                    ",", "_"
+                )
+                self.check_zeek_or_bro()
+                self.prepare_output_dir()
+                self.redis_man.start_redis_cache_if_not_running()
+                self.twid_width = self.conf.get_tw_width()
+                # should be initialised after self.input_type is set
+                self.host_ip_man = HostIPManager(self)
+                self.ap_manager = APManager(self)
+
+    def check_zeek_or_bro(self):
+        """
+        Check if we have zeek or bro
+        """
+        self.zeek_bro = None
+        if self.input_type not in (InputType.PCAP, InputType.INTERFACE):
+            return False
+
+        if shutil.which("zeek"):
+            self.zeek_bro = "zeek"
+        elif shutil.which("bro"):
+            self.zeek_bro = "bro"
+        else:
+            print("Error. No zeek or bro binary found.")
+            self.terminate_slips()
+            return False
+
+        return self.zeek_bro
+
+    def terminate_slips(self):
+        """
+        Shutdown slips, is called when stopping slips before
+        starting all modules. for example using -cb or -k
+        """
+        if self.mode == DAEMONIZED_MODE:
+            self.daemon.stop()
+        if not self.conf.get_cpu_profiler_enable():
+            sys.exit(0)  # leaves any children started by slips as orphans
+
+    def was_running_zeek(self) -> bool:
+        """returns true if zeek was used in this run"""
+        return (
+            self.db.is_running_non_stop()
+            or self.db.get_input_type() == InputType.PCAP
+        )
+
+    def store_zeek_dir_copy(self):
+        store_a_copy_of_zeek_files = self.conf.store_a_copy_of_zeek_files()
+        was_running_zeek = self.was_running_zeek()
+        if store_a_copy_of_zeek_files and was_running_zeek:
+            zeek_dir = self.db.get_zeek_output_dir()
+            if not isinstance(zeek_dir, str) or not zeek_dir:
+                return
+            # this is where the copy will be stored
+            dest_zeek_dir = os.path.join(self.args.output, "zeek_files")
+            copy_tree(zeek_dir, dest_zeek_dir)
+            print(f"[Main] Stored a copy of zeek files to {dest_zeek_dir}")
+
+    def delete_zeek_files(self):
+        zeek_dir = self.db.get_zeek_output_dir()
+        if (
+            self.conf.delete_zeek_files()
+            and isinstance(zeek_dir, str)
+            and zeek_dir
+        ):
+            shutil.rmtree(zeek_dir)
+
+    def del_file_or_dir(self, file):
+        """deletes a file or dir inside the output dir"""
+        file_path = os.path.join(self.args.output, file)
+        with contextlib.suppress(Exception):
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+
+    def construct_output_dir_name(self) -> str:
+        dir_name = os.path.join(
+            self.parent_output_dir,
+            os.path.basename(
+                self.input_information
+            ),  # get pcap name from path
+        )
+
+        # add timestamp to avoid conflicts e.g wlp3s0_2022-03-1_03:55
+        ts = utils.convert_ts_format(datetime.now(), "%Y-%m-%d_%H:%M:%S")
+        dir_name += f"_{ts}/"
+        return dir_name
+
+    def prepare_output_dir(self):
+        """
+        Clears the output dir if it already exists , or creates a
+        new one if it doesn't exist
+        Log dirs are stored in output/<input>_%Y-%m-%d_%H:%M:%S
+        @return: None
+        """
+        if self.args.is_slips_started_by_an_update:
+            # we should append to existing files in the output dir,
+            # and never overwrite them.
+            return
+
+        if not self.args.output:
+            # the user didnt give slips an output dir to use, construct one
+            self.args.output = self.construct_output_dir_name()
+            os.makedirs(self.args.output)
+
+            os.chmod(self.args.output, 0o777)
+            return
+
+        # -o is given
+        # delete all old files in the output dir
+        if os.path.exists(self.args.output):
+            for file in os.listdir(self.args.output):
+                # in integration tests, slips redirects its
+                # output to slips_output.txt,
+                # don't delete that file
+                if self.args.testing and "slips_output.txt" in file:
+                    continue
+                self.del_file_or_dir(file)
+
+        else:
+            os.makedirs(self.args.output)
+
+        os.chmod(self.args.output, 0o777)
+
+    def set_mode(self, mode, daemon=""):
+        """
+        Slips has 2 modes, daemonized and interactive, this function
+        sets up the mode so that slips knows in which mode it's operating
+        :param mode: daemonized of interavtive
+        :param daemon: Daemon() instance
+        """
+        self.mode = mode
+        self.daemon = daemon
+
+    def log(self, txt):
+        """
+        Is used instead of print for daemon debugging
+        """
+        with open(self.daemon.stdout, "a") as f:
+            f.write(f"{txt}\n")
+
+    def print(self, *args, **kwargs):
+        return self.printer.print(*args, **kwargs)
+
+    def handle_flows_from_stdin(self, input_information):
+        """
+        Make sure the stdin line type is valid (argus, suricata, or zeek)
+        when using -f stdin-type
+        """
+        if input_information.lower() not in (
+            "argus",
+            "suricata",
+            "zeek",
+        ):
+            print(f"[Main] Invalid file path {input_information}. Stopping.")
+            sys.exit(-1)
+
+        if self.mode == DAEMONIZED_MODE:
+            print("Can't read input from stdin in daemonized mode. Stopping")
+            sys.exit(-1)
+        line_type = input_information
+        input_type = InputType.STDIN
+        return input_type, line_type.lower()
+
+    def is_binetflow_line(self, line: str) -> bool:
+        return "->" in line or "StartTime" in line
+
+    def get_input_file_type(self, given_path) -> InputType:
+        """
+        given_path: given file
+        returns binetflow, pcap, nfdump, zeek_folder, suricata, etc.
+        """
+        # default value
+        input_type = InputType.FILE
+        # Get the type of file
+        cmd_result = subprocess.run(
+            ["file", utils.sanitize(given_path)], stdout=subprocess.PIPE
+        )
+        # Get command output
+        cmd_result = cmd_result.stdout.decode("utf-8")
+        if (
+            "pcap capture file" in cmd_result
+            or "pcapng capture file" in cmd_result
+        ) and os.path.isfile(given_path):
+            input_type = InputType.PCAP
+        elif (
+            "dBase" in cmd_result
+            or "nfcap" in given_path
+            or "nfdump" in given_path
+        ) and os.path.isfile(given_path):
+            input_type = InputType.NFDUMP
+            if shutil.which("nfdump") is None:
+                # If we do not have nfdump, terminate Slips.
+                print("nfdump is not installed. terminating slips.")
+                self.terminate_slips()
+        elif "CSV" in cmd_result and os.path.isfile(given_path):
+            input_type = InputType.BINETFLOW
+        elif "directory" in cmd_result and os.path.isdir(given_path):
+            for log_file in os.listdir(given_path):
+                # if there is at least 1 supported log file inside the
+                # given directory, start slips normally
+                # otherwise, stop slips
+                if not utils.is_ignored_zeek_log_file(log_file):
+                    input_type = InputType.ZEEK_FOLDER
+                    break
+            else:
+                print(
+                    f"Log files in {given_path} are not supported \n"
+                    f"Make sure all log files inside the given "
+                    f"directory end with .log or .log.labeled .. Stopping."
+                )
+                sys.exit(-1)
+        else:
+            # is it a zeek log file or suricata, binetflow tabs,
+            # or binetflow comma separated file?
+            # use first line to determine
+            with open(given_path, "r") as f:
+                while True:
+                    # get the first line that isn't a comment
+                    first_line = f.readline().replace("\n", "")
+                    if not first_line.startswith("#"):
+                        break
+            if "flow_id" in first_line:
+                input_type = InputType.SURICATA
+            else:
+                # this is a text file, it can be binetflow or zeek_log_file
+                try:
+                    # is it a json log file
+                    json.loads(first_line)
+                    input_type = InputType.ZEEK_LOG_FILE
+                except json.decoder.JSONDecodeError:
+                    # this is a tab separated file
+                    # is it zeek log file or binetflow file?
+
+                    # zeek tab files are separated by several spaces or tabs
+                    sequential_spaces_found = re.search(
+                        r"\s{1,}-\s{1,}", first_line
+                    )
+                    tabs_found = re.search("\t{1,}", first_line)
+                    commas_found = re.search(",{1,}", first_line)
+                    if sequential_spaces_found or tabs_found:
+                        if self.is_binetflow_line(first_line):
+                            # tab separated files are usually binetflow tab files
+                            input_type = InputType.BINETFLOW_TABS
+                        else:
+                            input_type = InputType.ZEEK_LOG_FILE
+                    elif commas_found and self.is_binetflow_line(first_line):
+                        # sometimes modified binetflow files aren't CSV,
+                        # and the file command return ASCII text, this is
+                        # probably the case
+                        return InputType.BINETFLOW
+        return input_type
+
+    def setup_print_levels(self):
+        """
+        setup debug and verbose levels
+        """
+        # Any verbosity passed as parameter overrides
+        # the configuration. Only check its value
+        if self.args.verbose is None:
+            self.args.verbose = self.conf.verbose()
+
+        # Limit any verbosity to > 0
+        self.args.verbose = max(self.args.verbose, 1)
+        # Any debug passed as parameter overrides the
+        # configuration. Only check its value
+        if self.args.debug is None:
+            self.args.debug = self.conf.debug()
+
+        # Debug levels must be > 0
+        self.args.debug = max(self.args.debug, 0)
+
+    def print_version(self):
+        slips_version = f"Slips {green(f'v{self.version}')}"
+        branch_info = utils.get_branch_info()
+        if branch_info is not False:
+            # it's false when we're in docker because there's no .git/ there
+            self.commit, self.branch = branch_info
+            slips_version += grey(f" ({self.commit[:8]})")
+        slips_version.replace("\n", "")
+        print(slips_version)
+
+    def update_stats(self):
+        """
+        updates the statistics printed every 5s
+        """
+        if not self.mode == "interactive":
+            return
+
+        # only update the stats every 5s
+        now = datetime.now()
+        if (
+            utils.get_time_diff(self.last_updated_stats_time, now, "seconds")
+            < 5
+        ):
+            return
+
+        self.last_updated_stats_time = now
+        now = utils.convert_ts_format(now, "%Y/%m/%d %H:%M:%S")
+        modified_ips_in_the_last_tw = self.db.get_modified_ips_in_the_last_tw()
+        profiles_len = self.db.get_profiles_len()
+        evidence_number = self.db.get_evidence_number() or 0
+        flow_per_min = self.db.get_flows_analyzed_per_minute()
+
+        current_risk_weight = None
+        if self.db.is_running_non_stop():
+            max_seen_risk_weight = self.db.get_max_seen_risk_weight()
+            current_risk_weight = max_seen_risk_weight[
+                "risk_weight"
+            ].name.lower()
+
+        stats = (
+            f"[{now}] Total analyzed IPs: {green(profiles_len)}. "
+            f"{self.get_analyzed_flows_percentage()}"
+            f"Evidence: {green(evidence_number)}. "
+        )
+
+        if current_risk_weight:
+            stats += f"Current risk: {green(current_risk_weight)}. "
+
+        stats += (
+            f"Number of IPs seen in the last ({self.twid_width}):"
+            f" {green(modified_ips_in_the_last_tw)}. "
+            f"Analyzed {green(flow_per_min)} flows/min."
+        )
+
+        self.print(stats)
+        sys.stdout.flush()  # Make sure the output is displayed immediately
+
+    def get_analyzed_flows_percentage(self) -> str:
+        """
+        returns a str with the percentage of analyzed flows so far (by
+        the profiler only) to be logged in the stats.
+
+        runs every 5s.
+        """
+        if self.is_total_flows_unknown():
+            return ""
+
+        if not hasattr(self, "total_flows"):
+            self.total_flows = self.db.get_total_flows()
+
+        processed = self.db.get_flows_analyzed_by_the_profiler_so_far()
+        if not processed:
+            return ""
+        try:
+            percentage = (processed / self.total_flows) * 100
+        except ZeroDivisionError:
+            return ""
+
+        percentage = min(100.0, percentage)  # cap at 100%
+
+        # in very large pcaps, thousands of flows are nothing compared to
+        # the tot flows, so if the percentage is int, slips would print 0%
+        # for a while, so we take the first number after the floating point
+        # to avoid this
+        if percentage < 1:
+            percentage = f"{percentage:.1f}"
+        else:
+            percentage = int(percentage)
+        return f"Analyzed Flows: {green(percentage)}{green('%')}. "
+
+    def is_total_flows_unknown(self) -> bool:
+        """
+        Determines if slips knows the total flows it's gonna be
+        reading beforehand or not
+        for example, we dont know the total flows when running on an interface,
+         a pcap, an input module like cyst, etc.
+        """
+        return (
+            self.args.input_module
+            or self.db.is_running_non_stop()
+            or self.input_type == InputType.PCAP
+        )
+
+    def get_slips_logfile(self) -> str:
+        if self.mode == "daemonized":
+            return self.daemon.stdout
+        elif self.mode == "interactive":
+            return os.path.join(self.args.output, "slips.log")
+
+    def get_slips_error_file(self) -> str:
+        if self.mode == "daemonized":
+            return self.daemon.stderr
+        elif self.mode == "interactive":
+            return os.path.join(self.args.output, "errors.log")
+
+    def print_gw_info(self):
+        if self.gw_info_printed:
+            return
+
+        for interface in utils.get_all_interfaces(self.args):
+            if ip := self.db.get_gateway_ip(interface):
+                self.print(header_line("Gateway IP", ip))
+            if mac := self.db.get_gateway_mac(interface):
+                self.print(header_line("Gateway MAC", mac))
+            self.gw_info_printed = True
+
+    def print_localnet_info(self):
+        if self.localnet_info_printed:
+            return
+
+        for interface in utils.get_all_interfaces(self.args):
+            local_net = self.db.get_local_network(interface)
+            if not local_net:
+                continue
+
+            value = local_net
+            if interface != "default":
+                value += f" ({interface})"
+            self.print(header_line("Local Net", value))
+            self.localnet_info_printed = True
+
+    def prepare_locks_dir(self):
+        """
+        Set secure shared permissions for the lock directory.
+
+        The directory must remain writable by root and non-root processes
+        because Slips may create lock files before and after dropping
+        privileges. Use the sticky bit so other users cannot remove or
+        replace lock files they do not own.
+        """
+        SQLiteFlock.prepare_locks_dir()
+
+    def start(self):
+        """Main Slips Function"""
+        try:
+            self.print_version()
+            print(grey("stratosphereips.org"))
+            print_separator()
+
+            self.setup_print_levels()
+            stderr: str = self.get_slips_error_file()
+            slips_logfile: str = self.get_slips_logfile()
+            # if stdout is redirected to a file,
+            # tell output.py to redirect it's output as well
+            self.logger = self.proc_man.start_output_process(
+                stderr, slips_logfile
+            )
+            self.printer = Printer(self.logger, self.name)
+
+            self.print(header_line("Logs", self.args.output))
+
+            self.redis_port: int = self.redis_man.get_redis_port()
+            if self.args.is_slips_started_by_an_update:
+                # -u means slips is started by slips after it auto-updated,
+                # the redis server should already be up, this slips should
+                # just connect to it
+                start_redis_server = False
+                self.print(
+                    f"Slips is done auto updating. Currently running "
+                    f"version: {green(utils.get_current_version())}"
+                )
+            else:
+                # dont start the redis server if it's already started
+                start_redis_server = not utils.is_port_in_use(self.redis_port)
+
+            try:
+                self.db = DBManager(
+                    self.logger,
+                    self.args.output,
+                    self.redis_port,
+                    self.conf,
+                    int(self.pid),
+                    start_redis_server=start_redis_server,
+                    # if auto update is enabled, slips starts itself with
+                    # -u, and continues using the same db as the old
+                    # version without overwriting the keys there
+                    flush_db=not self.args.is_slips_started_by_an_update,
+                )
+
+            except RuntimeError as e:
+                self.print(str(e), 1, 1)
+                self.terminate_slips()
+
+            if self.args.access_point:
+                # is -ap given but no AP running?
+                if not self.ap_manager.is_ap_running():
+                    self.print(
+                        "Slips was started with -ap but can't detect a "
+                        "running access point. Please start an access point "
+                        "and restart Slips. Stopping."
+                    )
+                    self.terminate_slips()
+                else:
+                    self.print(yellow("Slips is running in AP mode."))
+                    self.ap_manager.store_ap_interfaces(self.input_information)
+
+            if self.args.growing:
+                self.print(
+                    f"Running on a growing zeek dir: {self.args.growing}"
+                )
+
+            self.db.set_input_metadata(
+                {
+                    "output_dir": self.args.output,
+                    "commit": self.commit,
+                    "branch": self.branch,
+                    # we need to set this in the db because some modules use
+                    # it as soon as they start
+                    "input_type": self.input_type,
+                }
+            )
+
+            self.update_man = self.proc_man.start_slips_update_manager()
+
+            # this  func should be called as soon as we start the db,
+            # before evdience proc starts.
+            # to be able to use the host IP as analyzer IP in alerts.json
+            # should be after setting the input metadata with "input_type"
+            host_ips = self.host_ip_man.store_host_ip()
+
+            self.print(
+                header_line("Redis", f"localhost:{self.redis_port}"),
+                1,
+                0,
+            )
+            if host_ips:
+                for iface, ip in host_ips.items():
+                    self.print(
+                        header_line("Host IP", f"{ip} ({iface})"),
+                        1,
+                        0,
+                    )
+            self.proc_man.set_total_processes_to_start(
+                will_load_modules=not self.args.db
+            )
+            print_separator()
+            self.proc_man.announce_started(
+                Modules.MAIN,
+                self.pid,
+                "Coordinates all other slips processes and modules",
+                self.db,
+            )
+            self.profilers_manager.cpu_profiler_init()
+            self.profilers_manager.memory_profiler_init()
+
+            # log the PID of the started redis-server
+            # should be here after we're sure that the server was started
+            redis_pid = self.redis_man.get_pid_of_redis_server(self.redis_port)
+            self.redis_man.log_redis_server_pid(self.redis_port, redis_pid)
+
+            self.db.set_slips_mode(self.mode)
+
+            if self.mode == DAEMONIZED_MODE:
+                std_files = {
+                    "stderr": self.daemon.stderr,
+                    "stdout": self.daemon.stdout,
+                    "stdin": self.daemon.stdin,
+                    "pidfile": self.daemon.pidfile,
+                    "logsfile": self.daemon.logsfile,
+                }
+            else:
+                std_files = {
+                    "stderr": stderr,
+                    "stdout": slips_logfile,
+                }
+
+            self.db.store_std_file(**std_files)
+
+            # if slips is given a .rdb file, don't load the
+            # modules as we don't need them
+            if not self.args.db:
+                self.bloom_filters_man: BFManager = (
+                    self.proc_man.init_bloom_filters_manager()
+                )
+                # update local files before starting modules
+                # if wait_for_TI_to_finish is set to true in the config file,
+                # slips will wait untill all TI files are updated before
+                # starting the rest of the modules
+                self.proc_man.start_feeds_update_manager(
+                    local_files=True,
+                    ti_feeds=self.conf.wait_for_TI_to_finish(),
+                )
+                # initialize_filter must be called after the update manager
+                # is started, and before the modules start. why? because
+                # update manager updates the iocs that the bloom filters need
+                self.bloom_filters_man.initialize_filter()
+
+                self.proc_man.load_modules()
+
+            self.proc_man.install_shutdown_signal_handlers()
+
+            self.proc_man.start_evidence_process()
+            self.proc_man.start_profiler_process()
+            if not (
+                self.proc_man.is_profiler_done_starting_initial_workers_event.is_set()
+            ):
+                # give the profiler process time to start and subscribe to the db
+                # before we start sending data to it
+                time.sleep(0.1)
+
+            self.c1 = self.db.subscribe("control_channel")
+
+            self.metadata_man.add_metadata_if_enabled()
+            self.input_process = self.proc_man.start_input_process()
+
+            self.db.store_pid("main", int(self.pid))
+
+            self.proc_man.declare_that_slips_is_done_starting_all_children()
+
+            self.metadata_man.set_input_metadata()
+
+            # warn about unused open redis servers
+            open_servers = len(self.redis_man.get_open_redis_servers())
+            if open_servers > 1:
+                self.print(
+                    f"Warning: You have {open_servers} "
+                    f"redis servers running. "
+                    f"Run Slips with --killall to stop them."
+                )
+
+            self.print(
+                "Warning: Slips may generate a large amount "
+                "of traffic by querying TI sites."
+            )
+
+            if self.conf.generate_performance_plots():
+                self.print(
+                    f"Slips will generate performance plots on shutdown in "
+                    f"{green(get_performance_plots_dir(self.args.output))}."
+                )
+
+            while (not self.proc_man.should_stop_slips()) and (
+                not self.proc_man.shutdown_signal_received
+            ):
+                # Sleep some time to do routine checks and give time for
+                # more traffic to come
+                time.sleep(5)
+                self.proc_man.print_disabled_modules()
+
+                self.print_gw_info()
+                self.print_localnet_info()
+
+                self.update_stats()
+                self.timewindow_man.update_current_timewindow_if_due()
+                self.db.check_tw_to_close()
+                self.db.ping()
+                self.proc_man.health_check_modules()
+
+                modified_profiles: Set[str] = (
+                    self.metadata_man.update_slips_stats_in_the_db()[1]
+                )
+
+                self.host_ip_man.update_host_ip(host_ips, modified_profiles)
+                if self.update_man.check_for_slips_new_version_every_1_day():
+                    self.update_man.update_slips()
+
+        except KeyboardInterrupt:
+            self.proc_man.handle_keyboard_interrupt()
+
+        self.proc_man.shutdown_gracefully()

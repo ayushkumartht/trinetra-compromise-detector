@@ -1,0 +1,22 @@
+name: unit-tests
+
+on:
+  pull_request:
+    branches:
+      - '!master'
+      - 'develop'
+
+jobs:
+  unit-tests:
+    # Dependabot PRs to develop are handled by dependabot-develop-tests.yml,
+    # which runs the tests on a freshly built Docker image instead.
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    uses: ./.github/workflows/test-suite.yml
+    with:
+      test_suite_name: unit-tests
+      test_dir: tests/unit
+      test_path_prefix: tests/unit/
+      pytest_workers: "5"
+      timeout_minutes: 120
+      output_path: output/unit_tests
+      artifact_name_prefix: test_slips-output-

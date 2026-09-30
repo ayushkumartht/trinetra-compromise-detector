@@ -1,0 +1,56 @@
+# Ignore all .log files in output/ dir
+output/*.log
+output*/
+output_dir*/
+**/alerts.json
+**/.git
+*.whl
+iris/orgsig
+
+#node modules
+**/node_modules
+
+
+# files with API keys/tokens
+config/slack_bot_token_secret
+config/warden.conf
+config/RiskIQ_credentials
+
+
+Datasett/
+Dataset/
+
+# virtual env files
+ENV/*
+env/*
+.venv/
+venv/
+# local task scratch dirs (gitignored, can hold GBs of results)
+tasks/
+p2ptrust_runtime/
+peer*_demo/
+
+# compiled yara rules
+modules/leak_detector/yara_rules/compiled/
+
+
+.git/
+.cache/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# CESNET module logs
+*.log
+
+# redis backups
+**/*.rdb
+
+# for IntelliJ IDE
+.idea/
+
+# for vscode
+.vscode/
+
+# permanent p2p dbs and encryption keys
+permanent/

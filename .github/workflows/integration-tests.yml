@@ -1,0 +1,23 @@
+name: integration-tests
+
+on:
+  pull_request:
+    branches:
+      - '!master'
+      - 'develop'
+
+jobs:
+  integration-tests:
+    # Dependabot PRs to develop are handled by dependabot-develop-tests.yml,
+    # which runs the tests on a freshly built Docker image instead.
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    uses: ./.github/workflows/test-suite.yml
+    with:
+      test_suite_name: integration-tests
+      test_dir: tests/integration
+      output_prefix: integration/
+      test_path_prefix: tests/
+      pytest_workers: "3"
+      timeout_minutes: 1800
+      output_path: output/integration_tests
+      artifact_name_suffix: -integration-output

@@ -1,0 +1,17 @@
+SUPPORTED_LOGFILES = (
+    "conn",
+    "dns",
+    "http",
+    "ssl",
+    "ssh",
+    "dhcp",
+    "ftp",
+    "smtp",
+    "tunnel",
+    "notice",
+    "files",
+    "arp",
+    "software",
+    "weird",
+    "login",
+)

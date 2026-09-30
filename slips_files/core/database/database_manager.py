@@ -1,0 +1,1648 @@
+# SPDX-FileCopyrightText: 2021 Sebastian Garcia <sebastian.garcia@agents.fel.cvut.cz>
+# SPDX-License-Identifier: GPL-2.0-only
+import csv
+import json
+import os
+import shutil
+import sqlite3
+import time
+from pathlib import Path
+from typing import (
+    Dict,
+    Iterable,
+    List,
+    Optional,
+)
+
+
+from slips_files.common.printer import Printer
+from slips_files.common.slips_utils import utils
+from slips_files.core.database.redis_db.database import RedisDB
+from slips_files.core.database.sqlite_db.database import SQLiteDB
+from slips_files.common.parsers.config_parser import ConfigParser
+from slips_files.common.output_paths import (
+    get_this_filepath_inside_permanent_dir,
+)
+from slips_files.common.performance_paths import get_performance_csv_path
+from slips_files.core.structures.evidence import Evidence, EvidenceType
+from slips_files.core.structures.alerts import Alert
+from slips_files.core.output import Output
+
+
+class DBManager:
+    """
+    This class will be calling methods from the appropriate db.
+    each method added to any of the dbs should have a
+    handler in here.
+    """
+
+    name = "db_manager"
+
+    def __init__(
+        self,
+        logger: Output,
+        output_dir,
+        redis_port,
+        conf,
+        main_pid: int,
+        start_sqlite=True,
+        start_redis_server=True,
+        **kwargs,
+    ):
+        """
+        Initialize Redis and SQLite database handlers.
+
+        :param logger: output logger used by database handlers.
+        :param output_dir: directory where database files and logs are stored.
+        :param redis_port: port used to connect to Redis.
+        :param conf: loaded Slips configuration parser.
+        :param main_pid: PID of the main Slips process.
+        :param start_sqlite: whether to initialize the SQLite handler.
+        :param start_redis_server: whether to start Redis before connecting.
+
+        :param kwargs: additional RedisDB options. Supported keys are:
+            flush_db: whether this manager may flush Redis on startup when
+                the configuration also allows deleting previous DB contents.
+        """
+        self.conf = conf
+        self.output_dir = output_dir
+        self.redis_port = redis_port
+        self.main_pid = main_pid
+        self.logger = logger
+        self.printer = Printer(self.logger, self.name)
+        self.source_module: str = ""
+        self.regex_generator_storage = None
+        self.t_cell_storage = None
+        # only the main process should ever flush the Redis DB. to avoid
+        # children overwriting values set at the very start of slips
+        if os.getpid() != main_pid:
+            kwargs = dict(kwargs)
+            kwargs.setdefault("flush_db", False)
+
+        self.rdb = RedisDB(
+            self.logger, redis_port, output_dir, start_redis_server, **kwargs
+        )
+        self.constants = self.rdb.constants
+
+        self.trust_db = None
+        if self.conf.use_local_p2p():
+            # import this on demand because slips light version doesn't
+            # include the P2P dir
+            from modules.p2p_trust.trust.trustdb import TrustDB
+
+            self.trust_db_path: str = self.init_p2p_trust_db()
+            self.trust_db = TrustDB(
+                self.logger,
+                self.trust_db_path,
+                main_pid,
+                drop_tables_on_startup=False,
+            )
+
+        # in some rare cases we don't wanna create the sqlite db from scratch,
+        # like when using -S to stop the daemon, we just wanna connect to
+        # the existing one
+        self.sqlite = None
+        if start_sqlite:
+            self.sqlite = SQLiteDB(self.logger, output_dir, main_pid)
+        self.all_interfaces = utils.get_all_interfaces(self.conf.get_args())
+        self.channels = self.rdb.channels
+
+    def is_db_malformed(self, db_path: str) -> bool:
+        try:
+            with sqlite3.connect(db_path, timeout=3) as conn:
+                cursor = conn.execute("PRAGMA integrity_check;")
+                result = cursor.fetchone()
+                return result[0] != "ok"
+        except sqlite3.DatabaseError as e:
+            self.print(f"Database error during integrity_check: {e}")
+            return True
+
+    def backup_db(self, db_path: str):
+        """
+        Backs up the database file to a new file with a timestamp. and
+        deleted the file at db_path if successfully backed up.
+        """
+        try:
+            # backup the DB aside (optional safety)
+            date_time = utils.get_human_readable_datetime(
+                format="%Y-%m-%dT%H:%M:%S"
+            )
+            backup_path = f"{db_path}.{date_time}.bak"
+            shutil.move(db_path, backup_path)
+
+            db_short = Path(db_path).parent.name + "/" + Path(db_path).name
+            backup_short = (
+                Path(backup_path).parent.name + "/" + Path(backup_path).name
+            )
+            self.print(
+                f"{db_short} backup is at {backup_short}. "
+                f"Creating a new one at {db_short}."
+            )
+        except Exception as e:
+            raise Exception(
+                f"Failed to backup DB {db_path}: {e}. "
+                f"Please Manually back it up and remove it and "
+                f"restart Slips."
+            )
+
+    def init_p2p_trust_db(self) -> str:
+        """
+        Initialize and return the path to the persistent local P2P trust DB.
+
+        Returns:
+            Path to the local P2P trust SQLite database.
+        """
+        p2p_trust_runtime_dir = get_this_filepath_inside_permanent_dir(
+            "p2p_trust_runtime"
+        )
+
+        Path(p2p_trust_runtime_dir).mkdir(parents=True, exist_ok=True)
+
+        db_path = os.path.join(p2p_trust_runtime_dir, "trustdb.db")
+        self.p2p_trust_runtime_dir = p2p_trust_runtime_dir
+
+        if os.path.exists(db_path):
+            if self.is_db_malformed(db_path):
+                self.print(
+                    "trustdb.db is malformed. Backing it up and creating another one..."
+                )
+                self.backup_db(db_path)
+            if not self.has_write_access_to_sqlite(db_path):
+                self.print(
+                    "trustdb.db is not writable. Backing it up and "
+                    "creating another one..."
+                )
+                self.backup_db(db_path)
+                # TODO LAST THING HERE IS WE'RE NOT CREATING A NEW DB AFTER
+                #  BACKING UP THE OLDONE??
+
+        return db_path
+
+    def has_write_access_to_sqlite(self, db_path: str) -> bool:
+        """Check if the current process has write access to the
+        SQLite database file."""
+        try:
+            db_file = Path(db_path)
+            # Check if file exists and is writable at the OS level
+            if db_file.exists():
+                if not os.access(db_path, os.W_OK):
+                    return False
+            else:
+                # If file doesn't exist, check write access to parent directory
+                if not os.access(db_file.parent, os.W_OK):
+                    return False
+
+            # Try an actual write transaction in SQLite
+            conn = sqlite3.connect(f"file:{db_path}?mode=rw", uri=True)
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS __write_test__ (id INTEGER)"
+            )
+            cursor.execute("DROP TABLE __write_test__")
+            conn.rollback()
+            conn.close()
+            return True
+
+        except (
+            sqlite3.OperationalError,
+            sqlite3.DatabaseError,
+            PermissionError,
+        ):
+            return False
+
+    def get_p2p_trust_dir(self) -> str:
+        return self.p2p_trust_runtime_dir
+
+    def get_p2p_trust_db_path(self) -> str:
+        return self.trust_db_path
+
+    def print(self, *args, **kwargs):
+        return self.printer.print(*args, **kwargs)
+
+    def reset_pending_llm_request_counts(self):
+        """Clear requester-level in-flight shared-LLM request counters."""
+        return self.rdb.reset_pending_llm_request_counts()
+
+    def increment_pending_llm_request_count(self, requester: str):
+        """Increment the in-flight shared-LLM request count for one requester."""
+        return self.rdb.increment_pending_llm_request_count(requester)
+
+    def decrement_pending_llm_request_count(self, requester: str):
+        """Decrement the in-flight shared-LLM request count for one requester."""
+        return self.rdb.decrement_pending_llm_request_count(requester)
+
+    def get_pending_llm_request_count(self, requester: str) -> int:
+        """Return the in-flight shared-LLM request count for one requester."""
+        return self.rdb.get_pending_llm_request_count(requester)
+
+    @classmethod
+    def read_configuration(cls):
+        conf = ConfigParser()
+        cls.width = conf.get_tw_width_in_seconds()
+
+    def iterate_flows(self, *args, **kwargs):
+        return self.sqlite.iterate_flows(*args, **kwargs)
+
+    def get_columns(self, *args, **kwargs):
+        return self.sqlite.get_columns(*args, **kwargs)
+
+    def publish(self, *args, **kwargs):
+        return self.rdb.publish(*args, **kwargs)
+
+    def subscribe(self, *args, **kwargs):
+        return self.rdb.subscribe(*args, **kwargs)
+
+    def unsubscribe(self, *args, **kwargs):
+        return self.rdb.unsubscribe(*args, **kwargs)
+
+    def publish_stop(self, *args, **kwargs):
+        return self.rdb.publish_stop(*args, **kwargs)
+
+    def get_message(self, *args, **kwargs):
+        return self.rdb.get_message(*args, **kwargs)
+
+    def is_running_non_stop(self, *args, **kwargs):
+        return self.rdb.is_running_non_stop(*args, **kwargs)
+
+    def get_flows_analyzed_per_minute(self, *args, **kwargs):
+        return self.rdb.get_flows_analyzed_per_minute(*args, **kwargs)
+
+    def ping(self, *args, **kwargs):
+        return self.rdb.ping(*args, **kwargs)
+
+    def get_ip_info(self, *args, **kwargs):
+        return self.rdb.get_ip_info(*args, **kwargs)
+
+    def set_new_ip(self, *args, **kwargs):
+        return self.rdb.set_new_ip(*args, **kwargs)
+
+    def store_known_fp_md5_hashes(self, *args, **kwargs):
+        return self.rdb.store_known_fp_md5_hashes(*args, **kwargs)
+
+    def is_known_fp_md5_hash(self, *args, **kwargs):
+        return self.rdb.is_known_fp_md5_hash(*args, **kwargs)
+
+    def set_ap_info(self, *args, **kwargs):
+        return self.rdb.set_ap_info(*args, **kwargs)
+
+    def get_ap_info(self, *args, **kwargs):
+        return self.rdb.get_ap_info(*args, **kwargs)
+
+    def get_slips_internal_time(self, *args, **kwargs):
+        return self.rdb.get_slips_internal_time(*args, **kwargs)
+
+    def get_malicious_profiles(self, *args, **kwargs):
+        return self.sqlite.get_malicious_profiles(*args, **kwargs)
+
+    def get_asn_info(self, *args, **kwargs):
+        return self.rdb.get_asn_info(*args, **kwargs)
+
+    def get_rdns_info(self, *args, **kwargs):
+        return self.rdb.get_rdns_info(*args, **kwargs)
+
+    def get_sni_info(self, *args, **kwargs):
+        return self.rdb.get_sni_info(*args, **kwargs)
+
+    def get_equivalent_tws(self, *args, **kwargs):
+        return self.rdb.get_equivalent_tws(*args, **kwargs)
+
+    def set_local_network(self, *args, **kwargs):
+        return self.rdb.set_local_network(*args, **kwargs)
+
+    def get_local_network(self, *args, **kwargs):
+        return self.rdb.get_local_network(*args, **kwargs)
+
+    def get_total_recognized_localnets(self, *args, **kwargs):
+        return self.rdb.get_total_recognized_localnets(*args, **kwargs)
+
+    def get_label_count(self, *args, **kwargs):
+        return self.rdb.get_label_count(*args, **kwargs)
+
+    def get_disabled_modules(self, *args, **kwargs):
+        return self.rdb.get_disabled_modules(*args, **kwargs)
+
+    def increment_profiler_workers_started(self, *args, **kwargs):
+        return self.rdb.increment_profiler_workers_started(*args, **kwargs)
+
+    def decrement_profiler_workers_started(self, *args, **kwargs):
+        return self.rdb.decrement_profiler_workers_started(*args, **kwargs)
+
+    def get_profiler_workers_started(self, *args, **kwargs):
+        return self.rdb.get_profiler_workers_started(*args, **kwargs)
+
+    def set_input_metadata(self, *args, **kwargs):
+        return self.rdb.set_input_metadata(*args, **kwargs)
+
+    def get_zeek_output_dir(self, *args, **kwargs):
+        return self.rdb.get_zeek_output_dir(*args, **kwargs)
+
+    def get_input_type(self, *args, **kwargs):
+        return self.rdb.get_input_type(*args, **kwargs)
+
+    def get_interface(self, *args, **kwargs):
+        return self.rdb.get_interface(*args, **kwargs)
+
+    def get_output_dir(self, *args, **kwargs):
+        return self.rdb.get_output_dir(*args, **kwargs)
+
+    def get_input_file(self, *args, **kwargs):
+        return self.rdb.get_input_file(*args, **kwargs)
+
+    def store_core_module_flows_per_second(self, *args, **kwargs):
+        return self.rdb.store_core_module_flows_per_second(*args, **kwargs)
+
+    def get_core_module_flows_per_second(self, *args, **kwargs):
+        return self.rdb.get_core_module_flows_per_second(*args, **kwargs)
+
+    def record_flow_per_minute(self, module: str, now: Optional[float] = None):
+        if not self.conf.generate_performance_plots():
+            return
+
+        now = time.time() if now is None else now
+        minute_ts = int(now // 60) * 60
+        self.rdb.increment_flows_per_minute(module, minute_ts)
+        self.rdb.record_flows_per_minute_module(module)
+        if (
+            not hasattr(self, "_last_flows_per_minute_bucket")
+            or self._last_flows_per_minute_bucket != minute_ts
+        ):
+            self._last_flows_per_minute_bucket = minute_ts
+            self._maybe_log_flows_per_minute(minute_ts)
+
+    def _maybe_log_flows_per_minute(self, minute_ts: int):
+        if not self.conf.generate_performance_plots():
+            return
+
+        if not self.rdb.try_acquire_flows_per_minute_log_lock():
+            return
+
+        try:
+            last_logged = self.rdb.get_last_logged_flows_per_minute()
+            if last_logged is None:
+                # Start tracking from the minute before the first flow.
+                self.rdb.set_last_logged_flows_per_minute(minute_ts - 60)
+                return
+
+            last_complete_minute = minute_ts - 60
+            if last_complete_minute <= last_logged:
+                return
+
+            modules = self.rdb.get_flows_per_minute_modules()
+            profiler_modules = sorted(
+                module
+                for module in modules
+                if self._is_profiler_module(module)
+            )
+            for ts in range(last_logged + 60, last_complete_minute + 1, 60):
+                input_count = self.rdb.get_flows_per_minute("input", ts)
+                profiler_counts = {
+                    module: self.rdb.get_flows_per_minute(module, ts)
+                    for module in profiler_modules
+                }
+                self._append_flows_per_minute_row(
+                    ts, input_count, profiler_counts
+                )
+                self.rdb.set_last_logged_flows_per_minute(ts)
+        finally:
+            self.rdb.release_flows_per_minute_log_lock()
+
+    def _append_flows_per_minute_row(
+        self, ts: int, input_count: int, profiler_counts: Dict[str, int]
+    ):
+        output_dir = self.get_output_dir() or self.output_dir
+        csv_path = get_performance_csv_path(output_dir, "flows_per_minute.csv")
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        profiler_columns = self._get_profiler_columns(profiler_counts.keys())
+        desired_header = ["ts", "input_flows_per_min"] + profiler_columns
+        header = self._ensure_flows_per_minute_header(csv_path, desired_header)
+
+        with open(csv_path, "a", newline="") as handle:
+            writer = csv.writer(handle)
+            if os.path.getsize(csv_path) == 0:
+                writer.writerow(header)
+            row = self._build_flows_per_minute_row(
+                ts, input_count, profiler_counts, header
+            )
+            writer.writerow(row)
+
+    def _is_profiler_module(self, module: str) -> bool:
+        module_lower = module.lower()
+        return module_lower.startswith("profiler")
+
+    def _get_profiler_columns(self, modules: Iterable[str]) -> List[str]:
+        columns = []
+        for module in modules:
+            column = self._profiler_column_for_module(module)
+            if column:
+                columns.append(column)
+        return self._sort_profiler_columns(columns)
+
+    def _profiler_column_for_module(self, module: str) -> Optional[str]:
+        module_lower = module.lower()
+        if module_lower == "profiler":
+            return "profiler_flows_per_min"
+        prefix_map = (
+            "profilerworker_process_",
+            "profilerworker_",
+            "profiler_worker_",
+            "profiler_",
+        )
+        for prefix in prefix_map:
+            if module_lower.startswith(prefix):
+                suffix = module_lower.split(prefix, 1)[1]
+                if not suffix:
+                    return "profiler_flows_per_min"
+                return f"profiler_flows_per_min_worker{suffix}"
+        return None
+
+    def _sort_profiler_columns(self, columns: List[str]) -> List[str]:
+        unique_columns = list(dict.fromkeys(columns))
+        worker_prefix = "profiler_flows_per_min_worker"
+
+        def sort_key(name: str):
+            if name == "profiler_flows_per_min":
+                return (0, -1, "")
+            if name.startswith(worker_prefix):
+                suffix = name[len(worker_prefix) :]
+                if suffix.isdigit():
+                    return (0, int(suffix), "")
+                return (1, 0, suffix)
+            return (2, 0, name)
+
+        return sorted(unique_columns, key=sort_key)
+
+    def _ensure_flows_per_minute_header(
+        self, csv_path: str, desired_header: List[str]
+    ) -> List[str]:
+        if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+            return desired_header
+
+        with open(csv_path, newline="") as handle:
+            reader = csv.reader(handle)
+            existing_header = next(reader, [])
+
+        if not existing_header:
+            return desired_header
+
+        if existing_header == desired_header:
+            return existing_header
+
+        merged_header = self._merge_flows_per_minute_headers(
+            existing_header, desired_header
+        )
+        if merged_header != existing_header:
+            self._rewrite_flows_per_minute_csv(
+                csv_path, existing_header, merged_header
+            )
+        return merged_header
+
+    def _merge_flows_per_minute_headers(
+        self, existing_header: List[str], desired_header: List[str]
+    ) -> List[str]:
+        base_columns = ["ts", "input_flows_per_min"]
+        profiler_columns = self._sort_profiler_columns(
+            [
+                column
+                for column in existing_header + desired_header
+                if column.startswith("profiler_flows_per_min")
+            ]
+        )
+        other_columns = [
+            column
+            for column in existing_header + desired_header
+            if column not in base_columns and column not in profiler_columns
+        ]
+        other_columns = list(dict.fromkeys(other_columns))
+        return base_columns + profiler_columns + other_columns
+
+    def _rewrite_flows_per_minute_csv(
+        self, csv_path: str, old_header: List[str], new_header: List[str]
+    ):
+        tmp_path = f"{csv_path}.tmp"
+        with (
+            open(csv_path, newline="") as handle,
+            open(tmp_path, "w", newline="") as out_handle,
+        ):
+            reader = csv.reader(handle)
+            writer = csv.writer(out_handle)
+            next(reader, None)
+            writer.writerow(new_header)
+            for row in reader:
+                row_map = {
+                    old_header[idx]: row[idx]
+                    for idx in range(min(len(old_header), len(row)))
+                }
+                writer.writerow(
+                    [row_map.get(column, "0") for column in new_header]
+                )
+        os.replace(tmp_path, csv_path)
+
+    def _build_flows_per_minute_row(
+        self,
+        ts: int,
+        input_count: int,
+        profiler_counts: Dict[str, int],
+        header: List[str],
+    ) -> List[int]:
+        row_map: Dict[str, int] = {
+            "ts": ts,
+            "input_flows_per_min": input_count,
+        }
+        for module, count in profiler_counts.items():
+            column = self._profiler_column_for_module(module)
+            if column:
+                row_map[column] = count
+        return [row_map.get(column, 0) for column in header]
+
+    def get_accumulated_threat_level(self, *args, **kwargs):
+        return self.rdb.get_accumulated_threat_level(*args, **kwargs)
+
+    def get_max_seen_risk_weight(self, *args, **kwargs):
+        return self.rdb.get_max_seen_risk_weight(*args, **kwargs)
+
+    def update_max_seen_risk_weight(self, *args, **kwargs):
+        return self.rdb.update_max_seen_risk_weight(*args, **kwargs)
+
+    def get_risk_weight_of_last_alert(self, *args, **kwargs):
+        return self.rdb.get_risk_weight_of_last_alert(*args, **kwargs)
+
+    def set_risk_weight_of_last_alert(self, *args, **kwargs):
+        return self.rdb.set_risk_weight_of_last_alert(*args, **kwargs)
+
+    def update_accumulated_threat_level(self, *args, **kwargs):
+        return self.rdb.update_accumulated_threat_level(*args, **kwargs)
+
+    def set_ip_info(self, *args, **kwargs):
+        return self.rdb.set_ip_info(*args, **kwargs)
+
+    def set_peer_trust(self, *args, **kwargs):
+        return self.rdb.set_peer_trust(*args, **kwargs)
+
+    def get_peer_trust(self, *args, **kwargs):
+        return self.rdb.get_peer_trust(*args, **kwargs)
+
+    def get_dns_resolution(self, *args, **kwargs):
+        return self.rdb.get_dns_resolution(*args, **kwargs)
+
+    def is_ip_resolved(self, *args, **kwargs):
+        return self.rdb.is_ip_resolved(*args, **kwargs)
+
+    def delete_dns_resolution(self, *args, **kwargs):
+        return self.rdb.delete_dns_resolution(*args, **kwargs)
+
+    def should_store_resolution(self, *args, **kwargs):
+        return self.rdb.should_store_resolution(*args, **kwargs)
+
+    def set_dns_resolution(self, *args, **kwargs):
+        return self.rdb.set_dns_resolution(*args, **kwargs)
+
+    def set_domain_resolution(self, *args, **kwargs):
+        return self.rdb.set_domain_resolution(*args, **kwargs)
+
+    def set_slips_mode(self, *args, **kwargs):
+        return self.rdb.set_slips_mode(*args, **kwargs)
+
+    def get_slips_mode(self, *args, **kwargs):
+        return self.rdb.get_slips_mode(*args, **kwargs)
+
+    def get_modified_ips_in_the_last_tw(self, *args, **kwargs):
+        return self.rdb.get_modified_ips_in_the_last_tw(*args, **kwargs)
+
+    def is_connection_error_logged(self, *args, **kwargs):
+        return self.rdb.is_connection_error_logged(*args, **kwargs)
+
+    def mark_connection_error_as_logged(self, *args, **kwargs):
+        return self.rdb.mark_connection_error_as_logged(*args, **kwargs)
+
+    def get_redis_keys_len(self):
+        """
+        returns all the keys in redis
+        """
+        return int(self.rdb.get_redis_keys_len())
+
+    def was_ip_seen_in_connlog_before(self, *args, **kwargs):
+        return self.rdb.was_ip_seen_in_connlog_before(*args, **kwargs)
+
+    def mark_srcip_as_seen_in_connlog(self, *args, **kwargs):
+        return self.rdb.mark_srcip_as_seen_in_connlog(*args, **kwargs)
+
+    def get_ip_of_mac(self, *args, **kwargs):
+        return self.rdb.get_ip_of_mac(*args, **kwargs)
+
+    def get_modified_tw(self, *args, **kwargs):
+        return self.rdb.get_modified_tw(*args, **kwargs)
+
+    def get_field_separator(self, *args, **kwargs):
+        return self.rdb.get_field_separator(*args, **kwargs)
+
+    def store_tranco_whitelisted_domains(self, *args, **kwargs):
+        return self.rdb.store_tranco_whitelisted_domains(*args, **kwargs)
+
+    def get_tranco_top_domains(self, *args, **kwargs):
+        return self.rdb.get_tranco_top_domains(*args, **kwargs)
+
+    def is_whitelisted_tranco_domain(self, *args, **kwargs):
+        return self.rdb.is_whitelisted_tranco_domain(*args, **kwargs)
+
+    def get_ip_identification(self, *args, **kwargs):
+        return self.rdb.get_ip_identification(*args, **kwargs)
+
+    def get_multiaddr(self, *args, **kwargs):
+        return self.rdb.get_multiaddr(*args, **kwargs)
+
+    def get_labels(self, *args, **kwargs):
+        return self.rdb.get_labels(*args, **kwargs)
+
+    def set_port_info(self, *args, **kwargs):
+        return self.rdb.set_port_info(*args, **kwargs)
+
+    def get_port_info(self, *args, **kwargs):
+        return self.rdb.get_port_info(*args, **kwargs)
+
+    def set_ftp_port(self, *args, **kwargs):
+        return self.rdb.set_ftp_port(*args, **kwargs)
+
+    def is_ftp_port(self, *args, **kwargs):
+        return self.rdb.is_ftp_port(*args, **kwargs)
+
+    def set_organization_of_port(self, *args, **kwargs):
+        return self.rdb.set_organization_of_port(*args, **kwargs)
+
+    def set_organizations_of_ports(self, *args, **kwargs):
+        return self.rdb.set_organizations_of_ports(*args, **kwargs)
+
+    def get_organization_of_port(self, *args, **kwargs):
+        return self.rdb.get_organization_of_port(*args, **kwargs)
+
+    def add_zeek_file(self, *args, **kwargs):
+        return self.rdb.add_zeek_file(*args, **kwargs)
+
+    def get_all_zeek_files(self, *args, **kwargs):
+        return self.rdb.get_all_zeek_files(*args, **kwargs)
+
+    def get_gateway_ip(self, *args, **kwargs):
+        return self.rdb.get_gateway_ip(*args, **kwargs)
+
+    def get_gateway_mac(self, *args, **kwargs):
+        return self.rdb.get_gateway_mac(*args, **kwargs)
+
+    def get_gateway_mac_vendor(self, *args, **kwargs):
+        return self.rdb.get_gateway_mac_vendor(*args, **kwargs)
+
+    def set_default_gateway(self, *args, **kwargs):
+        return self.rdb.set_default_gateway(*args, **kwargs)
+
+    def get_domain_resolution(self, *args, **kwargs):
+        return self.rdb.get_domain_resolution(*args, **kwargs)
+
+    def get_all_dns_resolutions(self, *args, **kwargs):
+        return self.rdb.get_all_dns_resolutions(*args, **kwargs)
+
+    def set_passive_dns(self, *args, **kwargs):
+        return self.rdb.set_passive_dns(*args, **kwargs)
+
+    def get_passive_dns(self, *args, **kwargs):
+        return self.rdb.get_passive_dns(*args, **kwargs)
+
+    def get_reconnections_for_tw(self, *args, **kwargs):
+        return self.rdb.get_reconnections_for_tw(*args, **kwargs)
+
+    def set_reconnections(self, *args, **kwargs):
+        return self.rdb.set_reconnections(*args, **kwargs)
+
+    def get_host_ip(self, *args, **kwargs):
+        return self.rdb.get_host_ip(*args, **kwargs)
+
+    def get_wifi_interface(self, *args, **kwargs):
+        return self.rdb.get_wifi_interface(*args, **kwargs)
+
+    def get_all_host_ips(self, *args, **kwargs):
+        return self.rdb.get_all_host_ips(*args, **kwargs)
+
+    def set_new_incoming_flows(self, *args, **kwargs):
+        return self.rdb.set_new_incoming_flows(*args, **kwargs)
+
+    def will_slips_have_new_incoming_flows(self, *args, **kwargs):
+        return self.rdb.will_slips_have_new_incoming_flows(*args, **kwargs)
+
+    def set_host_ip(self, *args, **kwargs):
+        return self.rdb.set_host_ip(*args, **kwargs)
+
+    def set_asn_cache(self, *args, **kwargs):
+        return self.rdb.set_asn_cache(*args, **kwargs)
+
+    def get_asn_cache(self, *args, **kwargs):
+        return self.rdb.get_asn_cache(*args, **kwargs)
+
+    def store_pid(self, *args, **kwargs):
+        return self.rdb.store_pid(*args, **kwargs)
+
+    def increment_modules_started_count(self, *args, **kwargs):
+        return self.rdb.increment_modules_started_count(*args, **kwargs)
+
+    def get_pids(self, *args, **kwargs):
+        return self.rdb.get_pids(*args, **kwargs)
+
+    def set_org_info(self, *args, **kwargs):
+        return self.rdb.set_org_info(*args, **kwargs)
+
+    def set_org_cidrs(self, *args, **kwargs):
+        return self.rdb.set_org_cidrs(*args, **kwargs)
+
+    def get_org_info(self, *args, **kwargs):
+        return self.rdb.get_org_info(*args, **kwargs)
+
+    def get_org_ips(self, *args, **kwargs):
+        return self.rdb.get_org_ips(*args, **kwargs)
+
+    def set_whitelist(self, *args, **kwargs):
+        return self.rdb.set_whitelist(*args, **kwargs)
+
+    def get_whitelist(self, *args, **kwargs):
+        return self.rdb.get_whitelist(*args, **kwargs)
+
+    def is_whitelisted(self, *args, **kwargs):
+        return self.rdb.is_whitelisted(*args, **kwargs)
+
+    def is_domain_in_org_domains(self, *args, **kwargs):
+        return self.rdb.is_domain_in_org_domains(*args, **kwargs)
+
+    def is_asn_in_org_asn(self, *args, **kwargs):
+        return self.rdb.is_asn_in_org_asn(*args, **kwargs)
+
+    def is_ip_in_org_ips(self, *args, **kwargs):
+        return self.rdb.is_ip_in_org_cidrs(*args, **kwargs)
+
+    def has_cached_whitelist(self, *args, **kwargs):
+        return self.rdb.has_cached_whitelist(*args, **kwargs)
+
+    def is_doh_server(self, *args, **kwargs):
+        return self.rdb.is_doh_server(*args, **kwargs)
+
+    def get_analysis_info(self, *args, **kwargs):
+        return self.rdb.get_analysis_info(*args, **kwargs)
+
+    def store_dhcp_server(self, *args, **kwargs):
+        return self.rdb.store_dhcp_server(*args, **kwargs)
+
+    def is_dhcp_server(self, *args, **kwargs):
+        return self.rdb.is_dhcp_server(*args, **kwargs)
+
+    def store_official_dns_server(self, *args, **kwargs):
+        return self.rdb.store_official_dns_server(*args, **kwargs)
+
+    def is_official_dns_server(self, *args, **kwargs):
+        return self.rdb.is_official_dns_server(*args, **kwargs)
+
+    def save(self, *args, **kwargs):
+        return self.rdb.save(*args, **kwargs)
+
+    def load(self, *args, **kwargs):
+        return self.rdb.load(*args, **kwargs)
+
+    def is_valid_rdb_file(self, *args, **kwargs):
+        return self.rdb.is_valid_rdb_file(*args, **kwargs)
+
+    def set_last_warden_poll_time(self, *args, **kwargs):
+        return self.rdb.set_last_warden_poll_time(*args, **kwargs)
+
+    def get_last_warden_poll_time(self, *args, **kwargs):
+        return self.rdb.get_last_warden_poll_time(*args, **kwargs)
+
+    def store_blame_report(self, *args, **kwargs):
+        return self.rdb.store_blame_report(*args, **kwargs)
+
+    def store_zeek_path(self, *args, **kwargs):
+        return self.rdb.store_zeek_path(*args, **kwargs)
+
+    def get_zeek_path(self, *args, **kwargs):
+        return self.rdb.get_zeek_path(*args, **kwargs)
+
+    def store_std_file(self, *args, **kwargs):
+        return self.rdb.store_std_file(*args, **kwargs)
+
+    def get_stdfile(self, *args, **kwargs):
+        return self.rdb.get_stdfile(*args, **kwargs)
+
+    def set_evidence_causing_alert(self, *args, **kwargs):
+        return self.rdb.set_evidence_causing_alert(*args, **kwargs)
+
+    def get_evidence_causing_alert(self, *args, **kwargs):
+        return self.rdb.get_evidence_causing_alert(*args, **kwargs)
+
+    def get_evidence_by_id(self, *args, **kwargs):
+        return self.rdb.get_evidence_by_id(*args, **kwargs)
+
+    def set_flow_causing_evidence(self, *args, **kwargs):
+        return self.rdb.set_flow_causing_evidence(*args, **kwargs)
+
+    def get_flows_causing_evidence(self, *args, **kwargs):
+        """returns the list of uids of the flows causing evidence"""
+        return self.rdb.get_flows_causing_evidence(*args, **kwargs)
+
+    def _get_evidence_interface(self, evidence: Evidence) -> str:
+        """
+        Returns the interface of the first flow of the given evidence
+        PS: this function HAS TO return something, or else we wouldn't be
+        able to set an evidence without an interface. if slips is
+        completely unable to return the used interface, it returns "default"
+        """
+        # when slips is only monitoring 1 interface, must be it
+        if not self.all_interfaces:
+            self.interface = "default"
+            return "default"
+
+        if len(self.all_interfaces) == 1:
+            return self.all_interfaces[0]
+
+        elif len(self.all_interfaces) == 2:
+            # slips is running with -ap
+            try:
+                # get any flow uid of this evidence, to get the interface
+                # of it
+                uid = evidence.uid[0]
+            except (KeyError, IndexError, AttributeError):
+                # evidence doesnt have a uid?
+                return "default"
+
+            try:
+                flow: str = self.get_flow(uid)[uid]
+                if isinstance(flow, str):
+                    flow: dict = json.loads(flow)
+            except KeyError:
+                flow: dict = self.get_altflow_from_uid(uid)
+            return "default" if not flow else flow["interface"]
+
+    def set_evidence(self, evidence: Evidence):
+        if not self.rdb.belongs_to_run(self.output_dir):
+            return False
+
+        if evidence.evidence_type in self.conf.disabled_detections():
+            return
+
+        # whitelisted evidence are deleted from the db, so we need to check
+        # that we're not re-adding a deleted evidence
+        if self.sqlite.is_evidence_whitelisted(evidence.id):
+            return False
+
+        if not getattr(evidence, "source_module", ""):
+            evidence.source_module = self.source_module
+
+        if evidence.evidence_type in {
+            EvidenceType.HORIZONTAL_PORT_SCAN,
+            EvidenceType.VERTICAL_PORT_SCAN,
+        }:
+            evidence.uid = evidence.uid[:20]
+
+        interface: str | None = self._get_evidence_interface(evidence)
+        setattr(evidence, "interface", interface)
+        evidence_set = self.rdb.set_evidence(evidence)
+        if evidence_set:
+            self.sqlite.add_evidence(evidence)
+            # an evidence is generated for this profile
+            # update the threat level of this profile
+            self.update_threat_level(
+                str(evidence.attacker.profile),
+                str(evidence.threat_level),
+                evidence.confidence,
+            )
+        return evidence_set
+
+    def set_alert(
+        self, alert: Alert, evidence_causing_the_alert: Dict[str, Evidence]
+    ):
+        """
+        Sets the alert in the rdb and sqlite databases and labels each flow
+        that was responsible for this alert as "malicious"
+        """
+        self.rdb.set_alert(alert)
+        self.sqlite.add_alert(alert)
+
+        # when an alert is generated , we should set the threat level of the
+        # attacker's profile to 1(critical) and confidence 1
+        # so that it gets reported to other peers with these numbers
+        self.update_threat_level(str(alert.profile), "critical", 1)
+
+        for evidence_id in evidence_causing_the_alert.keys():
+            uids: List[str] = self.rdb.get_flows_causing_evidence(evidence_id)
+            self.set_flow_label(uids, "malicious")
+        return
+
+    def get_user_agents_count(self, *args, **kwargs):
+        return self.rdb.get_user_agents_count(*args, **kwargs)
+
+    def init_evidence_number(self, *args, **kwargs):
+        return self.rdb.init_evidence_number(*args, **kwargs)
+
+    def get_evidence_number(self, *args, **kwargs):
+        return self.rdb.get_evidence_number(*args, **kwargs)
+
+    def mark_evidence_as_processed(self, *args, **kwargs):
+        return self.rdb.mark_evidence_as_processed(*args, **kwargs)
+
+    def is_evidence_processed(self, *args, **kwargs):
+        return self.rdb.is_evidence_processed(*args, **kwargs)
+
+    def delete_evidence(self, *args, **kwargs):
+        return self.rdb.delete_evidence(*args, **kwargs)
+
+    def cache_whitelisted_evidence_id(self, *args, **kwargs):
+        return self.sqlite.mark_evidence_whitelisted(*args, **kwargs)
+
+    def is_whitelisted_evidence(self, *args, **kwargs):
+        return self.sqlite.is_evidence_whitelisted(*args, **kwargs)
+
+    def get_profileid_twid_alerts(self, *args, **kwargs):
+        return self.rdb.get_profileid_twid_alerts(*args, **kwargs)
+
+    def get_twid_evidence(self, profileid: str, twid: str) -> Dict[str, dict]:
+        evidence: Dict[str, dict] = self.rdb.get_twid_evidence(profileid, twid)
+        if not evidence:
+            return evidence
+
+        ip = profileid.split("_")[-1]
+        whitelisted_ids = self.sqlite.get_whitelisted_evidence_ids_in_tw(
+            ip, twid
+        )
+        return {
+            evidence_id: ev
+            for evidence_id, ev in evidence.items()
+            if evidence_id not in whitelisted_ids
+        }
+
+    def update_threat_level(
+        self, profileid: str, threat_level: str, confidence: float
+    ):
+        """updates the threat level and confidence of an ip in redis and
+        trust db for other peers to use it"""
+        if self.trust_db:
+            ip = profileid.split("_")[-1]
+            float_threat_level = utils.threat_levels[threat_level]
+            self.trust_db.insert_slips_score(
+                ip, float_threat_level, confidence
+            )
+        return self.rdb.update_threat_level(
+            profileid, threat_level, confidence
+        )
+
+    def set_loaded_ti_files(self, *args, **kwargs):
+        return self.rdb.set_loaded_ti_files(*args, **kwargs)
+
+    def get_loaded_ti_feeds_number(self, *args, **kwargs):
+        return self.rdb.get_loaded_ti_feeds_number(*args, **kwargs)
+
+    def get_loaded_ti_feeds(self, *args, **kwargs):
+        return self.rdb.get_loaded_ti_feeds(*args, **kwargs)
+
+    def set_cyst_enabled(self, *args, **kwargs):
+        return self.rdb.set_cyst_enabled(*args, **kwargs)
+
+    def is_cyst_enabled(self, *args, **kwargs):
+        return self.rdb.is_cyst_enabled(*args, **kwargs)
+
+    def give_threat_intelligence(self, *args, **kwargs):
+        return self.rdb.give_threat_intelligence(*args, **kwargs)
+
+    def store_tor_nodes(self, *args, **kwargs):
+        return self.rdb.store_tor_nodes(*args, **kwargs)
+
+    def is_tor_node(self, *args, **kwargs):
+        return self.rdb.is_tor_node(*args, **kwargs)
+
+    def delete_ips_from_ioc_ips(self, *args, **kwargs):
+        return self.rdb.delete_ips_from_ioc_ips(*args, **kwargs)
+
+    def delete_domains_from_ioc_domains(self, *args, **kwargs):
+        return self.rdb.delete_domains_from_ioc_domains(*args, **kwargs)
+
+    def add_ips_to_ioc(self, *args, **kwargs):
+        return self.rdb.add_ips_to_ioc(*args, **kwargs)
+
+    def add_domains_to_ioc(self, *args, **kwargs):
+        return self.rdb.add_domains_to_ioc(*args, **kwargs)
+
+    def add_ip_range_to_ioc(self, *args, **kwargs):
+        return self.rdb.add_ip_range_to_ioc(*args, **kwargs)
+
+    def add_asn_to_ioc(self, *args, **kwargs):
+        return self.rdb.add_asn_to_ioc(*args, **kwargs)
+
+    def is_blacklisted_asn(self, *args, **kwargs):
+        return self.rdb.is_blacklisted_asn(*args, **kwargs)
+
+    def add_ja3_to_ioc(self, *args, **kwargs):
+        return self.rdb.add_ja3_to_ioc(*args, **kwargs)
+
+    def add_jarm_to_ioc(self, *args, **kwargs):
+        return self.rdb.add_jarm_to_ioc(*args, **kwargs)
+
+    def add_ssl_sha1_to_ioc(self, *args, **kwargs):
+        return self.rdb.add_ssl_sha1_to_ioc(*args, **kwargs)
+
+    def get_all_blacklisted_ip_ranges(self, *args, **kwargs):
+        return self.rdb.get_all_blacklisted_ip_ranges(*args, **kwargs)
+
+    def get_all_blacklisted_ips(self, *args, **kwargs):
+        return self.rdb.get_all_blacklisted_ips(*args, **kwargs)
+
+    def get_all_blacklisted_domains(self, *args, **kwargs):
+        return self.rdb.get_all_blacklisted_domains(*args, **kwargs)
+
+    def get_all_blacklisted_ja3(self, *args, **kwargs):
+        return self.rdb.get_all_blacklisted_ja3(*args, **kwargs)
+
+    def is_blacklisted_jarm(self, *args, **kwargs):
+        return self.rdb.is_blacklisted_jarm(*args, **kwargs)
+
+    def is_blacklisted_ip(self, *args, **kwargs):
+        return self.rdb.is_blacklisted_ip(*args, **kwargs)
+
+    def is_blacklisted_ssl(self, *args, **kwargs):
+        return self.rdb.is_blacklisted_ssl(*args, **kwargs)
+
+    def is_blacklisted_domain(self, *args, **kwargs):
+        return self.rdb.is_blacklisted_domain(*args, **kwargs)
+
+    def delete_feed_entries(self, *args, **kwargs):
+        return self.rdb.delete_feed_entries(*args, **kwargs)
+
+    def is_profile_malicious(self, *args, **kwargs):
+        return self.rdb.is_profile_malicious(*args, **kwargs)
+
+    def store_lines_processors(self, *args, **kwargs):
+        return self.rdb.store_lines_processors(*args, **kwargs)
+
+    def get_line_processors(self, *args, **kwargs):
+        return self.rdb.get_line_processors(*args, **kwargs)
+
+    def set_ti_feed_info(self, *args, **kwargs):
+        return self.rdb.set_ti_feed_info(*args, **kwargs)
+
+    def set_feed_last_update_time(self, *args, **kwargs):
+        return self.rdb.set_feed_last_update_time(*args, **kwargs)
+
+    def get_ti_feed_info(self, *args, **kwargs):
+        return self.rdb.get_ti_feed_info(*args, **kwargs)
+
+    def delete_ti_feed(self, *args, **kwargs):
+        return self.rdb.delete_ti_feed(*args, **kwargs)
+
+    def is_cached_url_by_vt(self, *args, **kwargs):
+        return self.rdb.is_cached_url_by_vt(*args, **kwargs)
+
+    def get_domain_data(self, *args, **kwargs):
+        return self.rdb.get_domain_data(*args, **kwargs)
+
+    def set_info_for_domains(self, *args, **kwargs):
+        return self.rdb.set_info_for_domains(*args, **kwargs)
+
+    def cache_url_info_by_virustotal(self, *args, **kwargs):
+        return self.rdb.cache_url_info_by_virustotal(*args, **kwargs)
+
+    def get_outtuples_from_profile_tw(self, *args, **kwargs):
+        yield from self.rdb.get_outtuples_from_profile_tw(*args, **kwargs)
+
+    def get_intuples_from_profile_tw(self, *args, **kwargs):
+        yield from self.rdb.get_intuples_from_profile_tw(*args, **kwargs)
+
+    def get_info_about_not_established_flows(self, *args, **kwargs):
+        return self.rdb.get_info_about_not_established_flows(*args, **kwargs)
+
+    def get_uids_for_vertical_portscan(self, *args, **kwargs):
+        return self.rdb.get_uids_for_vertical_portscan(*args, **kwargs)
+
+    def is_there_estab_tcp_flows(self, *args, **kwargs):
+        return self.rdb.is_there_estab_tcp_flows(*args, **kwargs)
+
+    def get_dstports_of_flows(self, *args, **kwargs):
+        yield from self.rdb.get_dstports_of_flows(*args, **kwargs)
+
+    def incr_msgs_received_in_channel(self, *args, **kwargs):
+        return self.rdb.incr_msgs_received_in_channel(*args, **kwargs)
+
+    def get_enabled_modules(self, *args, **kwargs):
+        return self.rdb.get_enabled_modules(*args, **kwargs)
+
+    def set_available_llm_backends(self, *args, **kwargs):
+        return self.rdb.set_available_llm_backends(*args, **kwargs)
+
+    def get_available_llm_backends(self, *args, **kwargs):
+        return self.rdb.get_available_llm_backends(*args, **kwargs)
+
+    def get_msgs_received_at_runtime(self, *args, **kwargs):
+        return self.rdb.get_msgs_received_at_runtime(*args, **kwargs)
+
+    def get_msgs_published_in_channel(self, *args, **kwargs):
+        return self.rdb.get_msgs_published_in_channel(*args, **kwargs)
+
+    def get_dhcp_requested_addrs(self, *args, **kwargs):
+        return self.rdb.get_dhcp_requested_addrs(*args, **kwargs)
+
+    def add_dhcp_requested_addr(self, *args, **kwargs):
+        return self.rdb.add_dhcp_requested_addr(*args, **kwargs)
+
+    def get_dstips_with_not_established_flows(self, *args, **kwargs):
+        yield from self.rdb.get_dstips_with_not_established_flows(
+            *args, **kwargs
+        )
+
+    def get_dstports_of_not_established_flows(self, *args, **kwargs):
+        yield from self.rdb.get_dstports_of_not_established_flows(
+            *args, **kwargs
+        )
+
+    def get_total_dstips_for_not_estab_flows_on_port(self, *args, **kwargs):
+        return self.rdb.get_total_dstips_for_not_estab_flows_on_port(
+            *args, **kwargs
+        )
+
+    def get_uids_for_horizontal_portscan(self, *args, **kwargs):
+        return self.rdb.get_uids_for_horizontal_portscan(*args, **kwargs)
+
+    def get_timewindow(self, *args, **kwargs):
+        return self.rdb.get_timewindow(*args, **kwargs)
+
+    def get_current_timewindow(self, *args, **kwargs):
+        return self.rdb.get_current_timewindow(*args, **kwargs)
+
+    def incr_current_timewindow(self, *args, **kwargs):
+        return self.rdb.incr_current_timewindow(*args, **kwargs)
+
+    def add_out_http(self, *args, **kwargs):
+        return self.rdb.add_out_http(*args, **kwargs)
+
+    def add_out_dns(self, *args, **kwargs):
+        return self.rdb.add_out_dns(*args, **kwargs)
+
+    def get_final_state_from_flags(self, *args, **kwargs):
+        return self.rdb.get_final_state_from_flags(*args, **kwargs)
+
+    def add_ips(self, *args, **kwargs):
+        return self.rdb.add_ips(*args, **kwargs)
+
+    def get_altflow_from_uid(self, *args, **kwargs):
+        return self.sqlite.get_altflow_from_uid(*args, **kwargs)
+
+    def get_all_flows_in_profileid_twid(self, *args, **kwargs):
+        return self.sqlite.get_all_flows_in_profileid_twid(*args, **kwargs)
+
+    def get_all_altflows_in_profileid_twid(self, *args, **kwargs):
+        return self.sqlite.get_all_altflows_in_profileid_twid(*args, **kwargs)
+
+    def get_all_flows_in_profileid(self, *args, **kwargs):
+        return self.sqlite.get_all_flows_in_profileid(*args, **kwargs)
+
+    def get_all_flows(self, *args, **kwargs):
+        return self.sqlite.get_all_flows(*args, **kwargs)
+
+    def get_all_contacted_ips_in_profileid_twid(self, *args, **kwargs):
+        """
+        Get all the contacted IPs in a given profile and TW
+        """
+        return self.sqlite.get_all_contacted_ips_in_profileid_twid(
+            *args, **kwargs
+        )
+
+    def mark_profile_and_timewindow_as_blocked(self, *args, **kwargs):
+        return self.rdb.mark_profile_and_timewindow_as_blocked(*args, **kwargs)
+
+    def get_blocked_timewindows_of_profile(self, *args, **kwargs):
+        return self.rdb.get_blocked_timewindows_of_profile(*args, **kwargs)
+
+    def get_blocked_profiles_and_timewindows(self, *args, **kwargs):
+        return self.rdb.get_blocked_profiles_and_timewindows(*args, **kwargs)
+
+    def get_used_redis_port(self):
+        return self.rdb.get_used_port()
+
+    def get_attack_starttime(self, *args, **kwargs):
+        return self.rdb.get_attack_starttime(*args, **kwargs)
+
+    def is_blocked_profile_and_tw(self, *args, **kwargs):
+        return self.rdb.is_blocked_profile_and_tw(*args, **kwargs)
+
+    def add_software_to_profile(self, *args, **kwargs):
+        return self.rdb.add_software_to_profile(*args, **kwargs)
+
+    def get_total_flows(self, *args, **kwargs):
+        return self.rdb.get_total_flows(*args, **kwargs)
+
+    def increment_processed_flows(self, *args, **kwargs):
+        return self.rdb.increment_processed_flows(*args, **kwargs)
+
+    def get_flows_analyzed_by_the_profiler_so_far(self, *args, **kwargs):
+        return self.rdb.get_flow_analyzed_by_the_profiler_so_far(
+            *args, **kwargs
+        )
+
+    def add_out_ssh(self, *args, **kwargs):
+        return self.rdb.add_out_ssh(*args, **kwargs)
+
+    def add_out_notice(self, *args, **kwargs):
+        return self.rdb.add_out_notice(*args, **kwargs)
+
+    def add_out_ssl(self, *args, **kwargs):
+        return self.rdb.add_out_ssl(*args, **kwargs)
+
+    def get_first_flow_time(self, *args, **kwargs):
+        return self.rdb.get_first_flow_time(*args, **kwargs)
+
+    def get_profiles(self, *args, **kwargs):
+        return self.rdb.get_profiles(*args, **kwargs)
+
+    def get_number_of_alerts_so_far(self, *args, **kwargs):
+        return self.rdb.get_number_of_alerts_so_far(*args, **kwargs)
+
+    def get_tws_from_profile(self, *args, **kwargs):
+        return self.rdb.get_tws_from_profile(*args, **kwargs)
+
+    def get_t2_for_profile_tw(self, *args, **kwargs):
+        return self.rdb.get_t2_for_profile_tw(*args, **kwargs)
+
+    def has_profile(self, *args, **kwargs):
+        return self.rdb.has_profile(*args, **kwargs)
+
+    def publish_new_dhcp(self, *args, **kwargs):
+        return self.rdb.publish_new_dhcp(*args, **kwargs)
+
+    def publish_new_mac(self, *args, **kwargs):
+        return self.rdb.publish_new_mac(*args, **kwargs)
+
+    def publish_new_software(self, *args, **kwargs):
+        return self.rdb.publish_new_software(*args, **kwargs)
+
+    def get_profiles_len(self, *args, **kwargs):
+        return self.rdb.get_profiles_len(*args, **kwargs)
+
+    def get_last_twid_of_profile(self, *args, **kwargs):
+        return self.rdb.get_last_twid_of_profile(*args, **kwargs)
+
+    def get_first_twid_for_profile(self, *args, **kwargs):
+        return self.rdb.get_first_twid_for_profile(*args, **kwargs)
+
+    def get_tw_of_ts(self, *args, **kwargs):
+        return self.rdb.get_tw_of_ts(*args, **kwargs)
+
+    def add_new_tw(self, profileid, timewindow: str, startoftw: float):
+        self.rdb.add_new_tw(profileid, timewindow, startoftw)
+        # When a new TW is created for this profile,
+        # change the threat level of the profile to 0(info)
+        # and confidence to 0.05
+        self.update_threat_level(profileid, "info", 0.5)
+
+    def get_tw_start_time(self, *args, **kwargs):
+        return self.rdb.get_tw_start_time(*args, **kwargs)
+
+    def get_number_of_tws(self, *args, **kwargs):
+        return self.rdb.get_number_of_tws(*args, **kwargs)
+
+    def get_modified_profiles_since(self, *args, **kwargs):
+        return self.rdb.get_modified_profiles_since(*args, **kwargs)
+
+    def add_mac_addr_to_profile(self, *args, **kwargs):
+        return self.rdb.add_mac_addr_to_profile(*args, **kwargs)
+
+    def get_mac_addr_from_profile(self, *args, **kwargs):
+        return self.rdb.get_mac_addr_from_profile(*args, **kwargs)
+
+    def add_user_agent_to_profile(self, *args, **kwargs):
+        return self.rdb.add_user_agent_to_profile(*args, **kwargs)
+
+    def get_first_user_agent(self, *args, **kwargs):
+        return self.rdb.get_first_user_agent(*args, **kwargs)
+
+    def add_all_user_agent_to_profile(self, *args, **kwargs):
+        return self.rdb.add_all_user_agent_to_profile(*args, **kwargs)
+
+    def get_ip_last_seen_ts(self, *args, **kwargs):
+        return self.rdb.get_ip_last_seen_ts(*args, **kwargs)
+
+    def get_software_from_profile(self, *args, **kwargs):
+        return self.rdb.get_software_from_profile(*args, **kwargs)
+
+    def get_user_agent_from_profile(self, *args, **kwargs):
+        return self.rdb.get_user_agent_from_profile(*args, **kwargs)
+
+    def mark_profile_as_dhcp(self, *args, **kwargs):
+        return self.rdb.mark_profile_as_dhcp(*args, **kwargs)
+
+    def add_profile(self, profileid, starttime):
+        confidence = 0.05
+        if self.rdb.add_profile(profileid, starttime, confidence):
+            self.update_threat_level(profileid, "info", confidence)
+        return
+
+    def set_module_label_for_profile(self, *args, **kwargs):
+        return self.rdb.set_module_label_for_profile(*args, **kwargs)
+
+    def check_tw_to_close(self, *args, **kwargs):
+        return self.rdb.check_tw_to_close(*args, **kwargs)
+
+    def check_health(self):
+        self.rdb.pubsub.check_health()
+
+    def client_setname(self, *args, **kwarg):
+        self.rdb.client_setname(*args, **kwarg)
+
+    def mark_profile_tw_as_modified(self, *args, **kwargs):
+        return self.rdb.mark_profile_tw_as_modified(*args, **kwargs)
+
+    def add_tuple(self, *args, **kwargs):
+        return self.rdb.add_tuple(*args, **kwargs)
+
+    def get_modules_labels_of_a_profile(self, *args, **kwargs):
+        return self.rdb.get_modules_labels_of_a_profile(*args, **kwargs)
+
+    def add_timeline_line(self, *args, **kwargs):
+        return self.rdb.add_timeline_line(*args, **kwargs)
+
+    def get_timeline_last_lines(self, *args, **kwargs):
+        return self.rdb.get_timeline_last_lines(*args, **kwargs)
+
+    def get_profiled_tw_timeline(self, *args, **kwargs):
+        return self.rdb.get_profiled_tw_timeline(*args, **kwargs)
+
+    def mark_profile_as_gateway(self, *args, **kwargs):
+        return self.rdb.mark_profile_as_gateway(*args, **kwargs)
+
+    def set_blocked_ip(self, *args, **kwargs):
+        return self.rdb.set_blocked_ip(*args, **kwargs)
+
+    def get_blocking_timestamp(self, *args, **kwargs):
+        return self.rdb.is_ip_blocked(*args, **kwargs)
+
+    def del_blocked_ip(self, *args, **kwargs):
+        return self.rdb.del_blocked_ip(*args, **kwargs)
+
+    def set_firewall_block_state(self, *args, **kwargs):
+        return self.rdb.set_firewall_block_state(*args, **kwargs)
+
+    def get_firewall_block_states(self, *args, **kwargs):
+        return self.rdb.get_firewall_block_states(*args, **kwargs)
+
+    def del_firewall_block_state(self, *args, **kwargs):
+        return self.rdb.del_firewall_block_state(*args, **kwargs)
+
+    def set_ipv6_of_profile(self, *args, **kwargs):
+        return self.rdb.set_ipv6_of_profile(*args, **kwargs)
+
+    def set_ipv4_of_profile(self, *args, **kwargs):
+        return self.rdb.set_ipv4_of_profile(*args, **kwargs)
+
+    def get_mac_vendor_from_profile(self, *args, **kwargs):
+        """returns the mac vendor from the  offline vendors
+        db if not found in the redis db"""
+        mac_vendor = self.rdb.get_mac_vendor_from_profile(*args, **kwargs)
+        if mac_vendor:
+            return mac_vendor
+
+        try:
+            profileid = args[0]
+        except IndexError:
+            profileid = kwargs.get("profileid")
+
+        if not profileid:
+            return mac_vendor
+
+        mac_addr = self.rdb.get_mac_addr_from_profile(profileid)
+        if not mac_addr:
+            return mac_vendor
+
+        try:
+            mac_vendor = utils.get_mac_vendor_from_mac_addr(mac_addr)
+        except OSError:
+            return None
+
+        if mac_vendor:
+            self.rdb.set_mac_vendor_to_profile(profileid, mac_addr, mac_vendor)
+        return mac_vendor
+
+    def set_mac_vendor_to_profile(self, *args, **kwargs):
+        return self.rdb.set_mac_vendor_to_profile(*args, **kwargs)
+
+    def mark_ip_as_port_scanner(self, *args, **kwargs):
+        return self.rdb.mark_ip_as_port_scanner(*args, **kwargs)
+
+    def is_a_port_scanner(self, *args, **kwargs):
+        return self.rdb.is_a_port_scanner(*args, **kwargs)
+
+    def get_hostname_from_profile(self, *args, **kwargs):
+        return self.rdb.get_hostname_from_profile(*args, **kwargs)
+
+    def add_host_name_to_profile(self, *args, **kwargs):
+        return self.rdb.add_host_name_to_profile(*args, **kwargs)
+
+    def get_ipv4_from_profile(self, *args, **kwargs):
+        return self.rdb.get_ipv4_from_profile(*args, **kwargs)
+
+    def get_ipv6_from_profile(self, *args, **kwargs):
+        return self.rdb.get_ipv6_from_profile(*args, **kwargs)
+
+    def get_the_other_ip_version(self, *args, **kwargs):
+        return self.rdb.get_the_other_ip_version(*args, **kwargs)
+
+    def _get_regex_generator_storage(self):
+        if self.regex_generator_storage is None:
+            from slips_files.core.database.sqlite_db.regex_generator_db import (
+                RegexGeneratorStorage,
+            )
+
+            self.regex_generator_storage = RegexGeneratorStorage(
+                self.logger,
+                self.conf,
+                self.output_dir,
+                self.main_pid,
+            )
+        return self.regex_generator_storage
+
+    def get_generated_regexes(self, *args, **kwargs):
+        return self._get_regex_generator_storage().get_generated_regexes(
+            *args, **kwargs
+        )
+
+    def get_generated_regexes_count(self, *args, **kwargs):
+        return self._get_regex_generator_storage().get_generated_regexes_count(
+            *args, **kwargs
+        )
+
+    def _get_t_cell_storage(self):
+        if self.t_cell_storage is None:
+            from slips_files.core.database.sqlite_db.t_cell_db import (
+                TCellStorage,
+            )
+
+            self.t_cell_storage = TCellStorage(
+                self.logger,
+                self.conf,
+                self.output_dir,
+                self.main_pid,
+            )
+        return self.t_cell_storage
+
+    def get_t_cell_storage(self):
+        return self._get_t_cell_storage()
+
+    def get_icmp_attack_info_to_single_host(self, *args, **kwargs):
+        return self.rdb.get_icmp_attack_info_to_single_host(*args, **kwargs)
+
+    def get_icmp_attack_info_to_several_hosts(self, *args, **kwargs):
+        return self.rdb.get_icmp_attack_info_to_several_hosts(*args, **kwargs)
+
+    def init_tables(self, *args, **kwargs):
+        return self.sqlite.init_tables(*args, **kwargs)
+
+    def create_table(self, *args, **kwargs):
+        return self.sqlite.create_table(*args, **kwargs)
+
+    def set_flow_label(self, *args, **kwargs):
+        return self.sqlite.set_flow_label(*args, **kwargs)
+
+    def get_flow(self, *args, **kwargs):
+        """returns the raw flow as read from the log file"""
+        return self.sqlite.get_flow(*args, **kwargs)
+
+    def add_flow(self, flow, profileid: str, twid: str, label="benign"):
+        # stores it in the db
+        self.sqlite.add_flow(flow, profileid, twid, label=label)
+        # handles the channels and labels etc.
+        return self.rdb.add_flow(
+            flow, profileid=profileid, twid=twid, label=label
+        )
+
+    def get_slips_start_time(self):
+        return self.rdb.get_slips_start_time()
+
+    def set_slips_internal_time(self, ts):
+        return self.rdb.set_slips_internal_time(ts)
+
+    def add_altflow(self, *args, **kwargs):
+        return self.sqlite.add_altflow(*args, **kwargs)
+
+    def insert(self, *args, **kwargs):
+        return self.sqlite.insert(*args, **kwargs)
+
+    def update(self, *args, **kwargs):
+        return self.sqlite.update(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        return self.sqlite.delete(*args, **kwargs)
+
+    def select(self, *args, **kwargs):
+        return self.sqlite.select(*args, **kwargs)
+
+    def get_pid_of(self, *args, **kwargs):
+        return self.rdb.get_pid_of(*args, **kwargs)
+
+    def set_max_threat_level(self, *args, **kwargs):
+        return self.rdb.set_max_threat_level(*args, **kwargs)
+
+    def update_max_threat_level(self, *args, **kwargs):
+        return self.rdb.update_max_threat_level(*args, **kwargs)
+
+    def get_name_of_module_at(self, *args, **kwargs):
+        return self.rdb.get_name_of_module_at(*args, **kwargs)
+
+    def get_evidence_detection_threshold(self, *args, **kwargs):
+        return self.rdb.get_evidence_detection_threshold(*args, **kwargs)
+
+    def get_flows_count(self, *args, **kwargs):
+        return self.sqlite.get_flows_count(*args, **kwargs)
+
+    def get_redis_pid(self, *args, **kwargs):
+        return self.rdb.get_redis_pid(*args, **kwargs)
+
+    def export_labeled_flows(self, *args, **kwargs):
+        """
+        exports the labeled flows and altflows stored in sqlite
+        db to json or csv based on the config file
+        """
+        self.sqlite.export_labeled_flows(
+            self.get_output_dir(), *args, **kwargs
+        )
+
+    def get_commit(self, *args, **kwargs):
+        return self.rdb.get_commit(*args, **kwargs)
+
+    def get_zeek_version(self, *args, **kwargs):
+        return self.rdb.get_zeek_version(*args, **kwargs)
+
+    def get_branch(self, *args, **kwargs):
+        return self.rdb.get_branch(*args, **kwargs)
+
+    def get_tw_limits(self, *args, **kwargs):
+        return self.rdb.get_tw_limits(*args, **kwargs)
+
+    def try_claim_alert_generation(self, *args, **kwargs):
+        return self.rdb.try_claim_alert_generation(*args, **kwargs)
+
+    def release_alert_claim(self, *args, **kwargs):
+        return self.rdb.release_alert_claim(*args, **kwargs)
+
+    def close_sqlite(self, *args, **kwargs):
+        # when stopping the daemon using -S, slips doesn't start the sqlite db
+        if self.sqlite:
+            self.sqlite.close(*args, **kwargs)
+        if self.regex_generator_storage:
+            self.regex_generator_storage.close()
+        if self.t_cell_storage:
+            self.t_cell_storage.close()
+
+    def close_all_dbs(self):
+        self.rdb.r.close()
+        self.rdb.rcache.close()
+        self.close_sqlite()
+        if self.trust_db:
+            self.trust_db.close()
+
+    def get_fides_ti(self, target: str):
+        return self.rdb.get_fides_ti(target)
+
+    def save_fides_ti(self, target: str, sti: str):
+        self.rdb.save_fides_ti(target, sti)
+
+    def store_connected_peers(self, peers: List[str]):
+        self.rdb.store_connected_peers(peers)
+
+    def get_connected_peers(self):
+        return self.rdb.get_connected_peers()  # no data -> []
+
+    def store_peer_trust_data(self, peer_id: str, td: str):
+        self.rdb.store_peer_trust_data(peer_id, td)
+
+    def get_peer_trust_data(self, id: str):
+        return self.rdb.get_peer_td(id)
+
+    def record_p2p_message(self, *args, **kwargs):
+        return self.rdb.record_p2p_message(*args, **kwargs)
+
+    def get_p2p_message_telemetry(self, *args, **kwargs):
+        return self.rdb.get_p2p_message_telemetry(*args, **kwargs)
+
+    def store_authenticated_p2p_connection(self, *args, **kwargs):
+        return self.rdb.store_authenticated_p2p_connection(*args, **kwargs)
+
+    def remove_authenticated_p2p_connection(self, *args, **kwargs):
+        return self.rdb.remove_authenticated_p2p_connection(*args, **kwargs)
+
+    def get_authenticated_p2p_connections(self, *args, **kwargs):
+        return self.rdb.get_authenticated_p2p_connections(*args, **kwargs)
+
+    def del_stale_p2p_connections(self, *args, **kwargs):
+        return self.rdb.del_stale_p2p_connections(*args, **kwargs)
+
+    def is_p2p_related_flow(self, *args, **kwargs):
+        return self.rdb.is_p2p_related_flow(*args, **kwargs)
+
+    def is_p2p_related_flow_batch(self, *args, **kwargs):
+        return self.rdb.is_p2p_related_flow_batch(*args, **kwargs)
+
+    def cache_network_opinion(self, target: str, opinion: dict, time: float):
+        self.rdb.cache_network_opinion(target, opinion, time)
+
+    def get_cached_network_opinion(
+        self, target: str, cache_valid_seconds: int, current_time: float
+    ):
+        return self.rdb.get_cached_network_opinion(
+            target, cache_valid_seconds, current_time
+        )

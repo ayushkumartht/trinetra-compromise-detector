@@ -1,0 +1,909 @@
+# SPDX-FileCopyrightText: 2021 Sebastian Garcia <sebastian.garcia@agents.fel.cvut.cz>
+# SPDX-License-Identifier: GPL-2.0-only
+import json
+from datetime import datetime
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
+from slips_files.common.slips_utils import utils
+from slips_files.core.structures.alerts import Alert
+from slips_files.core.structures.evidence import (
+    Attacker,
+    Direction,
+    Evidence,
+    EvidenceType,
+    IoCType,
+    ProfileID,
+    ThreatLevel,
+    TimeWindow,
+)
+from slips_files.core.structures.risk_weights import (
+    LOW_RISK_WEIGHT,
+    RiskWeight,
+    get_risk_weight_for_accumulated_threat_level,
+)
+from tests.module_factory import ModuleFactory
+
+
+@pytest.mark.parametrize(
+    "profileid, our_ips, expected_result, expected_publish_call_count",
+    [
+        ("192.168.1.100", ["10.0.0.1", "172.16.0.1"], True, 1),
+        ("10.0.0.1", ["10.0.0.1", "172.16.0.1"], False, 0),
+        ("8.8.8.8", [], True, 1),
+    ],
+)
+def test_decide_blocking(
+    mocker, profileid, our_ips, expected_result, expected_publish_call_count
+):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.blocking_modules_supported = True
+    worker.our_ips = our_ips
+    with patch.object(worker.db, "publish") as mock_publish:
+        tw = TimeWindow(
+            2, "2025-05-09T13:27:45.123456", "2025-05-09T13:27:45.123456"
+        )
+        mocker.patch(
+            "slips_files.common.slips_utils.Utils.get_interface_of_ip",
+            return_value="eth0",
+        )
+
+        result = worker.decide_blocking(profileid, tw)
+
+    assert result == expected_result
+    assert mock_publish.call_count == expected_publish_call_count
+
+
+@pytest.mark.parametrize(
+    "profileid, twid, past_alerts, expected_output",
+    [
+        ("profile1_192.168.1.1", "timewindow1", {}, []),
+        (
+            "profile2_10.0.0.1",
+            "timewindow2",
+            {"alert1": '["evidence1", "evidence2"]'},
+            ["evidence1", "evidence2"],
+        ),
+    ],
+)
+def test_get_evidence_that_were_part_of_a_past_alert(
+    profileid, twid, past_alerts, expected_output
+):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.db.get_profileid_twid_alerts.return_value = past_alerts
+
+    result = worker.get_evidence_that_were_part_of_a_past_alert(
+        profileid, twid
+    )
+
+    assert result == expected_output
+
+
+def setup_worker(popup_enabled, blocked, mark_blocked=None):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    # popups are only shown when the parent process handed the worker a
+    # usable Notify obj
+    worker.notify = Mock(enabled=True) if popup_enabled else None
+
+    alert = Alert(
+        profile=ProfileID("1.2.3.4"),
+        timewindow=TimeWindow(1),
+        last_evidence=Mock(),
+        accumulated_threat_level=12.2,
+        last_flow_datetime="2024/10/04 15:45:30.123456+0000",
+    )
+    evidence = {"k": MagicMock(spec=Evidence)}
+
+    worker.db.set_alert = MagicMock()
+    worker.decide_blocking = MagicMock(side_effect=[False, mark_blocked])
+    worker.db.is_blocked_profile_and_tw = MagicMock(return_value=blocked)
+    worker.send_to_exporting_module = MagicMock()
+    worker.formatter.format_evidence_for_printing = MagicMock(
+        return_value="formatted_alert"
+    )
+    worker.print = MagicMock()
+    worker.show_popup = MagicMock()
+    worker.db.mark_profile_and_timewindow_as_blocked = MagicMock()
+    worker.log_alert = MagicMock()
+
+    return worker, alert, evidence
+
+
+@pytest.mark.parametrize("popup_enabled", [True, False])
+def test_handle_new_alert_already_blocked(popup_enabled):
+    worker, alert, evidence = setup_worker(popup_enabled, blocked=True)
+
+    worker.handle_new_alert(alert, evidence)
+
+    worker.db.set_alert.assert_called_once_with(alert, evidence)
+    worker.db.is_blocked_profile_and_tw.assert_called_once()
+    worker.send_to_exporting_module.assert_not_called()
+    worker.print.assert_not_called()
+    worker.show_popup.assert_not_called()
+    worker.db.mark_profile_and_timewindow_as_blocked.assert_not_called()
+    worker.log_alert.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "popup_enabled, expect_popup",
+    [
+        (True, True),
+        (False, False),
+    ],
+)
+def test_handle_new_alert_not_blocked(popup_enabled, expect_popup):
+    worker, alert, evidence = setup_worker(
+        popup_enabled, blocked=False, mark_blocked=True
+    )
+
+    worker.handle_new_alert(alert, evidence)
+
+    worker.send_to_exporting_module.assert_called_once_with(evidence)
+    worker.print.assert_called_once_with("formatted_alert", 1, 0)
+    if expect_popup:
+        worker.show_popup.assert_called_once_with(alert)
+    else:
+        worker.show_popup.assert_not_called()
+    worker.db.mark_profile_and_timewindow_as_blocked.assert_not_called()
+    worker.log_alert.assert_called_once_with(alert, blocked=False)
+
+
+@pytest.mark.parametrize("data", ["Test log entry", "Another log entry"])
+def test_add_to_log_file(data):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.evidence_logger_q.put = Mock()
+
+    worker.add_to_log_file(data)
+
+    worker.evidence_logger_q.put.assert_called_once_with(
+        {"to_log": data, "where": "alerts.log"}
+    )
+
+
+@pytest.mark.parametrize(
+    "all_uids, timewindow, accumulated_threat_level",
+    [
+        (["uid1", "uid2"], 1, 0.5),
+        ([], 10, 1.0),
+    ],
+)
+def test_add_alert_to_json_log_file(
+    all_uids, timewindow, accumulated_threat_level
+):
+    alert = Alert(
+        profile=ProfileID("192.168.1.20"),
+        timewindow=TimeWindow(
+            timewindow,
+            start_time="2024-10-04T18:46:50+03:00",
+            end_time="2024-10-04T19:46:50+03:00",
+        ),
+        last_evidence=Evidence(
+            evidence_type=EvidenceType.ARP_SCAN,
+            description="ARP scan detected",
+            attacker=Attacker(
+                direction=Direction.SRC,
+                ioc_type=IoCType.IP,
+                value="192.168.1.20",
+            ),
+            threat_level=ThreatLevel.INFO,
+            profile=ProfileID("192.168.1.20"),
+            timewindow=TimeWindow(timewindow),
+            uid=all_uids,
+            timestamp="1728417813.8868346",
+        ),
+        accumulated_threat_level=accumulated_threat_level,
+        last_flow_datetime="2024/10/04 15:45:30.123456+0000",
+    )
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.idmefv2.convert_to_idmef_alert = Mock(
+        return_value="alert_in_idmef_format"
+    )
+    worker.evidence_logger_q.put = Mock()
+
+    worker.add_alert_to_json_log_file(alert)
+
+    worker.evidence_logger_q.put.assert_called_once_with(
+        {
+            "to_log": "alert_in_idmef_format",
+            "where": "alerts.json",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "confidence, expected_output",
+    [
+        (0.80, "High"),
+        (0.55, "Medium"),
+        (0.54, "low"),
+    ],
+)
+def test_add_evidence_to_json_log_file_maps_confidence_to_string(
+    confidence, expected_output
+):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.idmefv2.convert_to_idmef_event = Mock(return_value={"ID": "e1"})
+    worker.evidence_logger_q.put = Mock()
+    worker.add_latency_to_csv = Mock()
+    evidence = Evidence(
+        evidence_type=EvidenceType.ARP_SCAN,
+        description="ARP scan detected",
+        attacker=Attacker(
+            direction=Direction.SRC,
+            ioc_type=IoCType.IP,
+            value="192.168.1.20",
+        ),
+        threat_level=ThreatLevel.INFO,
+        confidence=confidence,
+        profile=ProfileID("192.168.1.20"),
+        timewindow=TimeWindow(1),
+        uid=["uid1"],
+        timestamp="2024/10/04 15:45:30.123456+0000",
+        source_module="arp",
+    )
+
+    worker.add_evidence_to_json_log_file(evidence)
+
+    logged_evidence = worker.evidence_logger_q.put.call_args[0][0]["to_log"]
+    note = logged_evidence["Note"]
+    assert '"confidence":' in note
+    assert f'"confidence": "{expected_output}"' in note
+    assert '"source_module": "arp"' in note
+
+
+@pytest.mark.parametrize(
+    "accumulated_threat_level, accumulated_ratl",
+    [
+        (3.5, 7.0),
+        (0, 0),
+    ],
+)
+def test_add_evidence_to_json_log_file_adds_accumulated_ratl(
+    accumulated_threat_level, accumulated_ratl
+):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.idmefv2.convert_to_idmef_event = Mock(
+        return_value={"ID": "e1", "Note": json.dumps({"risk_level": "medium"})}
+    )
+    worker.evidence_logger_q.put = Mock()
+    worker.add_latency_to_csv = Mock()
+    evidence = Evidence(
+        evidence_type=EvidenceType.ARP_SCAN,
+        description="ARP scan detected",
+        attacker=Attacker(
+            direction=Direction.SRC,
+            ioc_type=IoCType.IP,
+            value="192.168.1.20",
+        ),
+        threat_level=ThreatLevel.INFO,
+        confidence=0.8,
+        profile=ProfileID("192.168.1.20"),
+        timewindow=TimeWindow(1),
+        uid=["uid1"],
+        timestamp="2024/10/04 15:45:30.123456+0000",
+        risk_level=RiskWeight.MEDIUM,
+    )
+
+    worker.add_evidence_to_json_log_file(
+        evidence,
+        accumulated_threat_level,
+        accumulated_ratl,
+    )
+
+    logged_evidence = worker.evidence_logger_q.put.call_args[0][0]["to_log"]
+    note = json.loads(logged_evidence["Note"])
+    assert note["accumulated_threat_level"] == accumulated_threat_level
+    assert note["risk_accumulated_threat_level"] == accumulated_ratl
+    assert note["risk_level"] == "medium"
+    assert note["evidence_type"] == str(evidence.evidence_type)
+
+
+def test_handle_evidence_added_message_sets_risk_level_on_objects() -> None:
+    module_factory = ModuleFactory()
+    worker = module_factory.create_evidence_handler_worker_obj()
+    events = []
+    worker.db.try_claim_alert_generation = Mock(
+        side_effect=lambda *args: events.append("claim_won") or True
+    )
+    worker.db.release_alert_claim = Mock(
+        side_effect=lambda *args: events.append("claim_released")
+    )
+    worker.db.mark_evidence_as_processed.side_effect = (
+        lambda *args: events.append("evidence_processed")
+    )
+    evidence = Evidence(
+        evidence_type=EvidenceType.ARP_SCAN,
+        description="ARP scan detected",
+        attacker=Attacker(
+            direction=Direction.SRC,
+            ioc_type=IoCType.IP,
+            value="192.168.1.20",
+        ),
+        threat_level=ThreatLevel.MEDIUM,
+        confidence=0.8,
+        profile=ProfileID("192.168.1.20"),
+        timewindow=TimeWindow(1),
+        uid=["uid1"],
+        timestamp="2024/10/04 15:45:30.123456+0000",
+    )
+    worker.whitelist.is_whitelisted_evidence.return_value = False
+    worker.is_running_non_stop = False
+    worker.formatter.add_threat_level_to_evidence_description = Mock(
+        return_value=evidence
+    )
+    worker.formatter.get_evidence_to_log = Mock(return_value="evidence_log")
+    worker.add_to_log_file = Mock()
+    worker.get_accumulated_threat_level = Mock(return_value=55.0)
+    worker.db.get_max_seen_risk_weight = Mock(
+        return_value={"risk_weight": RiskWeight.HIGH, "profile": ""}
+    )
+    worker.add_evidence_to_json_log_file = Mock()
+    worker.give_evidence_to_exporting_modules = Mock()
+    worker.get_evidence_for_tw = Mock(return_value={"e1": evidence})
+    worker.db.get_tw_limits = Mock(
+        return_value=(
+            "2024-10-04T15:00:00+00:00",
+            "2024-10-04T16:00:00+00:00",
+        )
+    )
+    worker.handle_new_alert = Mock(
+        side_effect=lambda *args: events.append("alert_stored")
+    )
+    worker.detection_threshold_in_this_width = 10.0
+
+    worker.handle_evidence_added_message(
+        {"data": json.dumps(utils.to_dict(evidence))}
+    )
+
+    worker.db.get_tw_limits.assert_called_once_with(
+        str(evidence.profile),
+        str(evidence.timewindow),
+        evidence.timestamp,
+    )
+    worker.db.try_claim_alert_generation.assert_called_once_with(
+        str(evidence.profile),
+        str(evidence.timewindow),
+    )
+    # the alert claim is released only after the alert is stored, and
+    # mark_evidence_as_processed doesn't need a claim at all.
+    assert events == [
+        "evidence_processed",
+        "claim_won",
+        "alert_stored",
+        "claim_released",
+    ]
+    logged_evidence = worker.add_evidence_to_json_log_file.call_args[0][0]
+    assert logged_evidence.risk_level == RiskWeight.HIGH
+
+    logged_alert = worker.handle_new_alert.call_args[0][0]
+    assert logged_alert.risk_level == RiskWeight.HIGH
+
+
+def test_generate_alert_if_threshold_crossed_skips_when_claim_lost() -> None:
+    """Verify losing the atomic claim skips alert generation entirely."""
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    evidence = Evidence(
+        evidence_type=EvidenceType.ARP_SCAN,
+        description="ARP scan detected",
+        attacker=Attacker(
+            direction=Direction.SRC,
+            ioc_type=IoCType.IP,
+            value="192.168.1.20",
+        ),
+        threat_level=ThreatLevel.MEDIUM,
+        confidence=0.8,
+        profile=ProfileID("192.168.1.20"),
+        timewindow=TimeWindow(1),
+        uid=["uid1"],
+        timestamp="2024/10/04 15:45:30.123456+0000",
+    )
+    worker.is_running_non_stop = False
+    worker.detection_threshold_in_this_width = 10.0
+    worker.db.try_claim_alert_generation = Mock(return_value=False)
+    worker.get_evidence_for_tw = Mock()
+    worker.handle_new_alert = Mock()
+    worker.db.release_alert_claim = Mock()
+
+    worker._generate_alert_if_threshold_crossed(
+        evidence,
+        str(evidence.profile),
+        str(evidence.timewindow),
+        accumulated_threat_level=55.0,
+        risk_accumulated_threat_level=55.0,
+        current_risk_weight=RiskWeight.HIGH,
+    )
+
+    worker.db.try_claim_alert_generation.assert_called_once_with(
+        str(evidence.profile),
+        str(evidence.timewindow),
+    )
+    worker.get_evidence_for_tw.assert_not_called()
+    worker.handle_new_alert.assert_not_called()
+    worker.db.release_alert_claim.assert_not_called()
+
+
+def test_generate_alert_if_threshold_crossed_releases_claim_on_error() -> None:
+    """Verify the claim is released even if alert generation raises."""
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    evidence = Evidence(
+        evidence_type=EvidenceType.ARP_SCAN,
+        description="ARP scan detected",
+        attacker=Attacker(
+            direction=Direction.SRC,
+            ioc_type=IoCType.IP,
+            value="192.168.1.20",
+        ),
+        threat_level=ThreatLevel.MEDIUM,
+        confidence=0.8,
+        profile=ProfileID("192.168.1.20"),
+        timewindow=TimeWindow(1),
+        uid=["uid1"],
+        timestamp="2024/10/04 15:45:30.123456+0000",
+    )
+    worker.is_running_non_stop = False
+    worker.detection_threshold_in_this_width = 10.0
+    worker.db.try_claim_alert_generation = Mock(return_value=True)
+    worker.get_evidence_for_tw = Mock(side_effect=RuntimeError("db error"))
+    worker.db.release_alert_claim = Mock()
+
+    with pytest.raises(RuntimeError):
+        worker._generate_alert_if_threshold_crossed(
+            evidence,
+            str(evidence.profile),
+            str(evidence.timewindow),
+            accumulated_threat_level=55.0,
+            risk_accumulated_threat_level=55.0,
+            current_risk_weight=RiskWeight.HIGH,
+        )
+
+    worker.db.release_alert_claim.assert_called_once_with(
+        str(evidence.profile),
+        str(evidence.timewindow),
+    )
+
+
+def test_disabled_evidence_message_is_deleted_without_processing() -> None:
+    """Reject disabled evidence even when a stale publisher sent it."""
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    evidence = Evidence(
+        evidence_type=EvidenceType.CONNECTION_WITHOUT_DNS,
+        description="Connection without DNS",
+        attacker=Attacker(
+            direction=Direction.SRC,
+            ioc_type=IoCType.IP,
+            value="10.0.0.1",
+        ),
+        threat_level=ThreatLevel.INFO,
+        confidence=0.8,
+        profile=ProfileID("10.0.0.1"),
+        timewindow=TimeWindow(1),
+        uid=["uid-disabled"],
+        timestamp="2024/10/04 15:45:30.123456+0000",
+    )
+    worker.conf.disabled_detections.return_value = [
+        EvidenceType.CONNECTION_WITHOUT_DNS
+    ]
+
+    worker.handle_evidence_added_message(
+        {"data": json.dumps(utils.to_dict(evidence))}
+    )
+
+    worker.db.delete_evidence.assert_called_once_with(
+        str(evidence.profile),
+        str(evidence.timewindow),
+        evidence.id,
+    )
+    worker.db.try_claim_alert_generation.assert_not_called()
+    worker.db.mark_evidence_as_processed.assert_not_called()
+
+
+def test_info_evidence_cannot_open_alert_from_existing_score() -> None:
+    """Verify zero-weight evidence never becomes an alert threshold trigger."""
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    evidence = Evidence(
+        evidence_type=EvidenceType.HTTP_TRAFFIC,
+        description="Unencrypted HTTP traffic",
+        attacker=Attacker(
+            direction=Direction.SRC,
+            ioc_type=IoCType.IP,
+            value="10.0.66.100",
+        ),
+        threat_level=ThreatLevel.INFO,
+        confidence=1.0,
+        profile=ProfileID("10.0.66.100"),
+        timewindow=TimeWindow(1),
+        uid=["uid-http"],
+        timestamp="2023/02/16 17:46:13.000000+0000",
+    )
+    worker.whitelist.is_whitelisted_evidence.return_value = False
+    worker.is_running_non_stop = False
+    worker.formatter.add_threat_level_to_evidence_description = Mock(
+        return_value=evidence
+    )
+    worker.formatter.get_evidence_to_log = Mock(return_value="evidence_log")
+    worker.add_to_log_file = Mock()
+    worker.get_accumulated_threat_level = Mock(return_value=55.0)
+    worker.db.get_max_seen_risk_weight = Mock(
+        return_value={"risk_weight": RiskWeight.HIGH, "profile": ""}
+    )
+    worker.add_evidence_to_json_log_file = Mock()
+    worker.give_evidence_to_exporting_modules = Mock()
+    worker.get_evidence_for_tw = Mock()
+    worker.handle_new_alert = Mock()
+
+    worker.handle_evidence_added_message(
+        {"data": json.dumps(utils.to_dict(evidence))}
+    )
+
+    worker.get_evidence_for_tw.assert_not_called()
+    worker.handle_new_alert.assert_not_called()
+
+
+def test_escalate_risk_level_stores_current_weight_for_first_alert() -> None:
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.db.get_risk_weight_of_last_alert = Mock(return_value={})
+    worker.db.set_risk_weight_of_last_alert = Mock()
+    worker.db.update_max_seen_risk_weight = Mock()
+    alert = Alert(
+        profile=ProfileID("1.2.3.4"),
+        timewindow=TimeWindow(1),
+        last_evidence=Mock(),
+        accumulated_threat_level=12.2,
+        last_flow_datetime="2024/10/04 15:45:30.123456+0000",
+        risk_level=RiskWeight.LOW,
+    )
+
+    escalated_alert = worker.escalate_risk_level(alert)
+
+    assert escalated_alert.risk_level == RiskWeight.LOW
+    worker.db.update_max_seen_risk_weight.assert_called_once_with(
+        "profile_1.2.3.4", RiskWeight.MEDIUM
+    )
+    worker.db.set_risk_weight_of_last_alert.assert_called_once_with(
+        RiskWeight.LOW, alert.timewindow
+    )
+
+
+def test_escalate_risk_level_increases_matching_weight() -> None:
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.db.get_risk_weight_of_last_alert = Mock(return_value=RiskWeight.LOW)
+    worker.db.set_risk_weight_of_last_alert = Mock()
+    worker.db.update_max_seen_risk_weight = Mock()
+    alert = Alert(
+        profile=ProfileID("1.2.3.4"),
+        timewindow=TimeWindow(1),
+        last_evidence=Mock(),
+        accumulated_threat_level=12.2,
+        last_flow_datetime="2024/10/04 15:45:30.123456+0000",
+        risk_level=RiskWeight.LOW,
+    )
+
+    escalated_alert = worker.escalate_risk_level(alert)
+
+    assert escalated_alert.risk_level == RiskWeight.MEDIUM
+    worker.db.update_max_seen_risk_weight.assert_called_once_with(
+        "profile_1.2.3.4", RiskWeight.MEDIUM
+    )
+    worker.db.set_risk_weight_of_last_alert.assert_called_once_with(
+        RiskWeight.MEDIUM, alert.timewindow
+    )
+
+
+def test_handle_new_alert_doesnt_show_popup_when_notify_is_disabled():
+    worker, alert, evidence = setup_worker(
+        popup_enabled=True, blocked=False, mark_blocked=True
+    )
+    worker.notify.enabled = False
+
+    worker.handle_new_alert(alert, evidence)
+
+    worker.show_popup.assert_not_called()
+
+
+def test_show_popup():
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.notify = Mock()
+    alert = Mock(spec=Alert)
+    worker.formatter.get_printable_alert = Mock(return_value="alert_time_desc")
+
+    worker.show_popup(alert)
+
+    worker.notify.show_popup.assert_called_once_with("alert_time_desc")
+
+
+@pytest.mark.parametrize(
+    ("is_running_non_stop", "expected_threshold"),
+    [
+        (True, 15),
+        (False, 15.0),
+    ],
+)
+def test_get_detection_threshold_uses_runtime_mode(
+    is_running_non_stop: bool, expected_threshold: float
+) -> None:
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.is_running_non_stop = is_running_non_stop
+    worker.risk_accumulated_threat_level_threshold = 15
+    worker.detection_threshold = 0.25
+    worker.width = 3600
+
+    assert worker._get_detection_threshold() == expected_threshold
+
+
+@pytest.mark.parametrize(
+    "accumulated_threat_level, expected_risk_weight",
+    [
+        (0.0, LOW_RISK_WEIGHT),
+        (5.0, LOW_RISK_WEIGHT),
+        (25.0, LOW_RISK_WEIGHT),
+        (50.0, LOW_RISK_WEIGHT),
+    ],
+)
+def test_get_float_risk_weight(
+    accumulated_threat_level: float, expected_risk_weight: float
+) -> None:
+    ModuleFactory().create_evidence_handler_worker_obj()
+
+    assert (
+        get_risk_weight_for_accumulated_threat_level(
+            accumulated_threat_level
+        ).weight
+        == expected_risk_weight
+    )
+
+
+def test_send_to_exporting_module():
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    tw_evidence = {
+        "evidence1": Evidence(
+            evidence_type=EvidenceType.ARP_SCAN,
+            description="ARP scan detected",
+            attacker=Attacker(
+                direction=Direction.SRC,
+                ioc_type=IoCType.IP,
+                value="192.168.1.1",
+            ),
+            threat_level=ThreatLevel.MEDIUM,
+            profile=ProfileID(ip="192.168.1.1"),
+            timewindow=TimeWindow(number=1),
+            uid=["uid1"],
+            timestamp="2023/04/01 10:00:00.000000+0000",
+        ),
+        "evidence2": Evidence(
+            evidence_type=EvidenceType.DNS_WITHOUT_CONNECTION,
+            description="DNS query without connection",
+            attacker=Attacker(
+                direction=Direction.SRC,
+                ioc_type=IoCType.IP,
+                value="192.168.1.2",
+            ),
+            threat_level=ThreatLevel.LOW,
+            profile=ProfileID(ip="192.168.1.2"),
+            timewindow=TimeWindow(number=1),
+            uid=["uid2"],
+            timestamp="2023/04/01 10:01:00.000000+0000",
+        ),
+    }
+
+    worker.exporting_modules_enabled = True
+    worker.db.publish = Mock()
+
+    worker.send_to_exporting_module(tw_evidence)
+
+    assert worker.db.publish.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "sys_argv, running_non_stop, expected_result",
+    [
+        (["-i", "-p"], True, True),
+        (["-i", "-im"], False, False),
+        ([], False, False),
+    ],
+)
+def test_is_blocking_module_supported(
+    sys_argv, running_non_stop, expected_result
+):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.is_running_non_stop = running_non_stop
+
+    with patch("sys.argv", sys_argv):
+        result = worker.is_blocking_modules_supported()
+
+    assert result == expected_result
+
+
+@pytest.mark.parametrize(
+    "evidence, past_evidence_ids, expected_result",
+    [
+        (
+            Evidence(
+                evidence_type=EvidenceType.ARP_SCAN,
+                description="",
+                attacker=Attacker(
+                    direction="SRC",
+                    ioc_type=IoCType.IP,
+                    value="192.168.1.1",
+                ),
+                threat_level=ThreatLevel.INFO,
+                profile=ProfileID("192.168.1.1"),
+                timewindow=TimeWindow(1),
+                uid=[],
+                timestamp=datetime.now().strftime("%Y/%m/%d %H:%M:%S.%f%z"),
+                id="1",
+            ),
+            [],
+            False,
+        ),
+        (
+            Evidence(
+                evidence_type=EvidenceType.ARP_SCAN,
+                description="",
+                attacker=Attacker(
+                    direction="SRC",
+                    ioc_type=IoCType.IP,
+                    value="192.168.1.1",
+                ),
+                threat_level=ThreatLevel.INFO,
+                profile=ProfileID("192.168.1.1"),
+                timewindow=TimeWindow(1),
+                uid=[],
+                timestamp=datetime.now().strftime("%Y/%m/%d %H:%M:%S.%f%z"),
+                id="2",
+            ),
+            ["2"],
+            True,
+        ),
+        (
+            Evidence(
+                evidence_type=EvidenceType.ARP_SCAN,
+                description="",
+                attacker=Attacker(
+                    direction="DST",
+                    ioc_type=IoCType.IP,
+                    value="192.168.1.1",
+                ),
+                threat_level=ThreatLevel.INFO,
+                profile=ProfileID("192.168.1.1"),
+                timewindow=TimeWindow(1),
+                uid=[],
+                timestamp=datetime.now().strftime("%Y/%m/%d %H:%M:%S.%f%z"),
+                id="3",
+            ),
+            [],
+            True,
+        ),
+    ],
+)
+def test_is_filtered_evidence(evidence, past_evidence_ids, expected_result):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+
+    result = worker.is_filtered_evidence(evidence, past_evidence_ids)
+
+    assert result == expected_result
+
+
+@pytest.mark.parametrize(
+    "evidence, expected_result",
+    [
+        (Mock(attacker=Mock(direction="SRC")), False),
+        (Mock(attacker=Mock(direction="DST")), True),
+    ],
+)
+def test_is_evidence_done_by_others(evidence, expected_result):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+
+    result = worker.is_evidence_done_by_others(evidence)
+
+    assert result == expected_result
+
+
+@pytest.mark.parametrize(
+    "confidence, threat_level, expected_output",
+    [
+        (0.5, ThreatLevel.LOW, 0.1),
+        (1.0, ThreatLevel.MEDIUM, 0.5),
+        (0.8, ThreatLevel.HIGH, 0.64),
+        (0.3, ThreatLevel.CRITICAL, 0.3),
+        (0.0, ThreatLevel.INFO, 0.0),
+    ],
+)
+def test_get_threat_level(confidence, threat_level, expected_output):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    evidence = Mock(spec=Evidence)
+    evidence.confidence = confidence
+    evidence.threat_level = threat_level
+
+    with patch.object(worker, "print") as mock_print:
+        result = worker.get_threat_level(evidence)
+
+    assert pytest.approx(result, abs=1e-6) == expected_output
+    mock_print.assert_called_once_with(
+        f"\t\tWeighted Threat Level: {result}", 3, 0
+    )
+
+
+@pytest.mark.parametrize(
+    "ip, twid, flow_datetime, accumulated_threat_level, blocked",
+    [
+        ("192.168.1.100", 1, "2023/10/26 10:10:10", 0.8, True),
+        ("10.0.0.100", 2, "2023/10/26 11:11:11", 1.0, False),
+    ],
+)
+def test_log_alert(
+    ip,
+    twid,
+    flow_datetime,
+    accumulated_threat_level,
+    blocked,
+):
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    worker.add_alert_to_json_log_file = Mock()
+    worker.add_to_log_file = Mock()
+    alert = Alert(
+        profile=ProfileID(ip),
+        timewindow=TimeWindow(twid),
+        last_evidence=Mock(),
+        accumulated_threat_level=accumulated_threat_level,
+        last_flow_datetime=flow_datetime,
+        risk_level=RiskWeight.LOW,
+    )
+
+    worker.log_alert(alert, blocked=blocked)
+
+    worker.add_alert_to_json_log_file.assert_called_once()
+    assert flow_datetime in worker.add_to_log_file.call_args[0][0]
+    assert str(twid) in worker.add_to_log_file.call_args[0][0]
+
+
+def test_p2p_tagged_evidence_is_excluded_from_scoring_and_blocking() -> None:
+    """Filter evidence only when all of its triggering flows are P2P."""
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    evidence = Mock(
+        id="p2p-evidence",
+        uid=["flow-a", "flow-b"],
+        attacker=Mock(direction="SRC"),
+    )
+    worker.db.get_flow.side_effect = lambda uid: {
+        uid: json.dumps(
+            {
+                "saddr": "1.1.1.1",
+                "sport": "6668",
+                "daddr": "2.2.2.2",
+                "dport": "51000",
+                "proto": "tcp",
+            }
+        )
+    }
+    worker.db.is_p2p_related_flow_batch.side_effect = lambda flows: [
+        True
+    ] * len(flows)
+
+    assert worker.is_filtered_evidence(evidence, []) is True
+
+
+def test_mixed_p2p_and_unrelated_evidence_is_not_filtered() -> None:
+    """Keep blocking eligible when any triggering traffic is unrelated."""
+    worker = ModuleFactory().create_evidence_handler_worker_obj()
+    evidence = Mock(
+        id="mixed-evidence",
+        uid=["p2p-flow", "other-flow"],
+        attacker=Mock(direction="SRC"),
+    )
+    worker.db.get_flow.side_effect = lambda uid: {
+        uid: json.dumps(
+            {
+                "saddr": "1.1.1.1" if uid == "p2p-flow" else "3.3.3.3",
+                "sport": "6668",
+                "daddr": "2.2.2.2",
+                "dport": "51000",
+                "proto": "tcp",
+            }
+        )
+    }
+    worker.db.is_p2p_related_flow_batch.side_effect = lambda flows: [
+        saddr == "1.1.1.1" for saddr, sport, daddr, dport, proto in flows
+    ]
+
+    assert worker.is_filtered_evidence(evidence, []) is False

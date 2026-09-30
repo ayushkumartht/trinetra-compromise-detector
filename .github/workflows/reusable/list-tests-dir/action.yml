@@ -1,0 +1,39 @@
+name: "List Test Files"
+description: "Auto discovery of integration and unit tests - Build JSON matrix of test files"
+inputs:
+  test_dir:
+    description: "Directory to search for test_*.py files"
+    required: true
+  output_prefix:
+    description: "Optional prefix to prepend to each file entry in the output array"
+    required: false
+    default: ""
+outputs:
+  test_files:
+    description: "JSON array of test file metadata objects"
+    value: ${{ steps.set-matrix.outputs.files }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: set-matrix
+      shell: bash
+      # inputs go through env so a crafted value can't become script content
+      env:
+        TEST_DIR: ${{ inputs.test_dir }}
+        PREFIX: ${{ inputs.output_prefix }}
+      run: |
+        FILES=$(find "$TEST_DIR" -name "test_*.py" -printf "%P\n" | jq -R -s -c --arg prefix "$PREFIX" '
+          split("\n")[:-1]
+          | map({
+              test_file: ($prefix + .),
+              display_name: (
+                split("/")
+                | if length >= 2
+                  then .[-2] + "/" + .[-1]
+                  else .[-1]
+                  end
+              )
+            })
+        ')
+        echo "files=$FILES" >> "$GITHUB_OUTPUT"

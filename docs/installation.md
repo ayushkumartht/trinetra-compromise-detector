@@ -1,0 +1,511 @@
+# Installation
+
+There are two ways to install and run Slips: inside a Docker or in your own computer. We suggest to install and to run Slips inside a Docker since all dependencies are already installed in there. However, current version of docker with Slips does not allow to capture the traffic from the computer's interface. We will describe both ways of installation anyway.
+
+
+
+## Table of Contents
+
+* [Docker](https://stratospherelinuxips.readthedocs.io/en/develop/installation.html#slips-in-docker)
+  * Dockerhub (recommended)
+    * [Linux and windows hosts](https://stratospherelinuxips.readthedocs.io/en/develop/installation.html#linux-and-windows-hosts)
+    * [MacOS hosts](https://stratospherelinuxips.readthedocs.io/en/develop/installation.html#macos-hosts)
+    * [Light Slips Image](#minimal-slips-docker-image)
+  * [Docker-compose](https://stratospherelinuxips.readthedocs.io/en/develop/installation.html#running-slips-using-docker-compose)
+  * [Dockerfile](https://stratospherelinuxips.readthedocs.io/en/develop/installation.html#building-slips-from-the-dockerfile)
+* Native
+  * [Using install.sh](https://stratospherelinuxips.readthedocs.io/en/develop/installation.html#install-slips-using-shell-script)
+  * [Manually](https://stratospherelinuxips.readthedocs.io/en/develop/installation.html#installing-slips-manually)
+* [on RPI (Beta)](https://stratospherelinuxips.readthedocs.io/en/develop/installation.html#installing-slips-on-a-raspberry-pi)
+
+
+
+## Requirements
+
+- Python 3.12.3
+- 5 GBs of disk space (for the Docker image)
+- at least 4 GBs of RAM
+
+## Slips in Docker
+
+Slips can be run inside a Docker. Either using our Docker image from DockerHub (recommended)
+or building Slips image from the Dockerfile for more advanced users.
+
+In both cases, you need to have the Docker platform installed in your computer.
+For instructions on how to install Docker, check https://docs.docker.com/get-docker/.
+
+The recommended way of using slips would be to
+* Run Slips from Dockerhub
+
+For more advanced users, you can:
+* [Run Slips using Docker Compose](#Running-Slips-using-docker-compose)
+* [Build Slips using the Dockerfile](#Running-Slips-using-the-dockerfile)
+
+
+### Running Slips from DockerHub
+
+#### Linux And Windows Hosts
+
+###### Analyze your own traffic
+
+	docker run -d --restart=unless-stopped --cpus=5 --cpu-shares "700" --memory="16g" --memory-swap="16g" --net=host --cap-add=NET_ADMIN -v /var/log/slips:/StratosphereLinuxIPS/output --name slips stratosphereips/slips:latest /StratosphereLinuxIPS/slips.py -i eno1 -o output/eno1
+
+
+- Please change the name of the interface on `-i` for your own.
+- Slips stores the alerts, logs, DB, and flows in the shared volume `/var/log/slips/`
+- This container has limits for memory and CPU
+
+Check the alerts slips generated that are stored in the host:
+
+      tail -f /var/log/slips/eno1/alerts.log
+
+
+#### MacOS Hosts
+
+###### Analyse your own traffic
+    docker run --platform linux/amd64 --rm -it -p 55000:55000 --cpu-shares "700" --memory="8g" --memory-swap="8g" --net=host --cap-add=NET_ADMIN -v $(pwd)/output:/StratosphereLinuxIPS/output -v $(pwd)/dataset:/StratosphereLinuxIPS/dataset --name slips stratosphereips/slips:latest /StratosphereLinuxIPS/slips.py -i eno1
+
+Please change the name of the interface to your own.
+Check the alerts slips generated
+
+      tail -f output/eno1*/alerts.log
+
+---
+
+To analyze your own files using slips, you can mount it to your docker using -v
+
+	mkdir ~/dataset
+	cp <some-place>/myfile.pcap ~/dataset
+	docker run -it --rm --net=host -v ~/dataset:/StratosphereLinuxIPS/dataset stratosphereips/slips:latest
+	./slips.py -f dataset/myfile.pcap
+
+
+#### Minimal Slips Docker Image
+In addition to the full stratosphereips/slips:latest image, there is now a minimal Docker image available: using `docker pull stratosphereips/slips_light:latest`.
+This image excludes the following modules to reduce size and resource usage:
+
+* rnn_cc_detection/
+* timeline/
+* kalipso/
+* p2ptrust/
+* ml_linear_model/
+* ml_online_model/
+* cyst/
+* cesnet/
+* exporting_alerts/
+* risk_iq/
+* template/
+* blocking/
+* virustotal/
+
+Additionally, several directories and files have been removed from this minimal image, including:
+dataset/, docs/, tests/
+
+Slips' two GUIs, kalipso and the web interface, aren't available in this image. The only way to check the slips output there is by going through the generated logs.
+
+The stratosphereips/slips_light:latest image is recommended for users who do not require these specific modules and want a more lightweight deployment.
+
+
+### Update slips image
+
+	docker pull stratosphereips/slips:latest
+
+
+### Run Slips sharing files between the host and the container
+
+The following instructions will guide you on how to run a Slips docker container with file sharing between the host and the container.
+
+```bash
+    # create a directory to load pcaps in your host computer
+    mkdir ~/dataset
+
+    # copy the pcap to analyze to the newly created folder
+    cp <some-place>/myfile.pcap ~/dataset
+
+    # create a new Slips container mapping the folder in the host to a folder in the container
+    docker run -it --rm --net=host --name slips -v $(pwd)/dataset:/StratosphereLinuxIPS/dataset stratosphereips/slips:latest
+
+    # run Slips on the pcap file mapped to the container
+    ./slips.py -f dataset/myfile.pcap
+```
+
+### Run Slips with access to block traffic on the host network
+
+In Linux OS, the Slips can be used to analyze and **block** network traffic on the host network interface. To allow the container to see the host interface traffic and block malicious connections, it needs to run with the option `--cap-add=NET_ADMIN`. This option enables the container to interact with the network stack of the host computer. To block malicious behavior, run Slips with the parameter `-p`.
+
+Change eno1 in the command below to your own interface
+
+```bash
+    # run a new Slips container with the option to interact with the network stack of the host
+    docker run -it --rm --net=host --cap-add=NET_ADMIN --name slips stratosphereips/slips:latest
+
+    # run Slips on the host interface `eno1` with active blocking `-p`
+    ./slips.py -i eno1 -p
+```
+
+---
+
+### Running Slips using docker compose
+
+
+Change enp1s0 to your current interface in docker/docker-compose.yml and start slips using
+
+    docker compose -f docker/docker-compose.yml up
+
+Now everything inside your host's ```config``` and ```dataset``` directories is
+mounted to ```/StratosphereLinuxIPS/config/``` and ```/StratosphereLinuxIPS/dataset/``` in Slips docker.
+
+To run slips on a pcap instead of your interface you can do the following:
+
+1. put the pcap in the ```dataset/``` dir in your host
+2. change the entrypoint in the docker compose file to
+    ["python3","/StratosphereLinuxIPS/slips.py","-f","dataset/<pcapname>.pcap"]
+3. restart slips using ```docker compose -f docker/docker-compose.yml up```
+
+
+#### Limitations
+
+The main limitation of running Slips in a Docker is that every time the container stops,
+all files inside the container are deleted, including the Redis database of cached data,
+and you lose all your Threat Intelligence (TI) data and previous detections.
+Next time you run Slips, it will start making detections without all the TI data until downloading the data again.
+The only solution is to keep the container up between scans.
+
+
+---
+
+### Building Slips from the Dockerfile
+
+Before building the docker locally from the Dockerfile, first you should clone Slips repo or download the code directly:
+
+	git clone https://github.com/stratosphereips/StratosphereLinuxIPS.git
+
+**NOTE**: you have to be in the main Slips directory to build this.
+
+If you cloned Slips in '~/StratosphereLinuxIPS', then you can build the Docker image with:
+
+	cd ~/StratosphereLinuxIPS
+	docker build --target amd --no-cache -t slips -f docker/Dockerfile .
+	docker run -it --rm --net=host slips
+	cp config/slips.yaml config/my_slips.yaml
+	./slips.py -c config/my_slips.yaml -f dataset/test3-mixed.binetflow
+
+If you don't have Internet connection from inside your Docker image while building, you may have another set of networks
+defined in your Docker. For that try:
+
+	docker build --target amd --network=host --no-cache -t slips -f docker/Dockerfile .
+
+You can also put your own files in the /dataset/ folder and analyze them with Slips:
+
+	cp some-pcap-file.pcap ~/StratosphereLinuxIPS/dataset
+	docker run -it --rm --net=host -v ~/StratosphereLinuxIPS/dataset/:/StratosphereLinuxIPS/dataset slips
+	./slips.py -f dataset/some-pcap-file.pcap
+
+
+Note that some GPUs don't support tensorflow in docker which may cause "Illegal instruction" errors when running slips.
+You can read more about it [here](https://stratospherelinuxips.readthedocs.io/en/develop/FAQ.html#getting-illegal-instruction-error-when-running-slips)
+
+---
+
+
+
+## Installing Slips natively
+
+Slips depends on three major elements:
+
+- Python 3.12.3
+- Zeek 8.0.0
+- Redis database v8
+
+
+To install these elements, the script will use the APT package manager. After that, it will install python packages required for Slips to run and its modules to work.
+
+
+**Instructions to download everything for Slips are below.**
+<br>
+
+### Install Slips using shell script
+You can install it using [install.sh](https://github.com/stratosphereips/StratosphereLinuxIPS/blob/master/install/install.sh)
+
+	sudo chmod +x install.sh
+	sudo ./install.sh
+
+The script installs Slips core dependencies and builds `p2p4slips`. It does
+not install Kalipso.
+
+### Installing Slips manually
+#### Installing Python, Redis, and required python libraries.
+
+Update the repository of packages so you see the latest versions:
+
+	apt-get update
+
+Install apt dependencies:
+
+    cat install/apt_dependencies.txt | xargs apt-get -y install
+
+Even though we just installed pip3, the package installer for Python (3.12.3), we need to upgrade it to its latest version:
+
+	python3 -m pip install --upgrade pip
+
+Now that pip3 is upgraded, we can proceed to install all required packages via pip3 python packet manager:
+
+	python3 -m pip3 install -r install/requirements.txt
+
+_Note: for those using a different base image, install the TensorFlow version pinned in `install/requirements.txt` via pip3._
+
+#### Optional Kalipso submodule
+
+Kalipso is maintained in a separate repository and checked out as the
+`modules/kalipso` submodule.
+
+If you cloned Slips without submodules, initialize it with:
+
+```bash
+git submodule update --init --recursive modules/kalipso
+```
+
+If you are cloning Slips for the first time and want all optional components,
+use:
+
+```bash
+git clone --recurse-submodules --remote-submodules https://github.com/stratosphereips/StratosphereLinuxIPS -j4
+```
+
+Kalipso has its own installation instructions in
+`modules/kalipso/README.md`. It is optional and not required for Docker, CI, or
+core Slips execution.
+
+
+####  Installing Zeek
+
+The last requirement to run Slips is Zeek.
+Zeek is not directly available on Ubuntu or Debian.
+To install it, we will first add the repository source to our apt package manager source list.
+The following two commands are for Ubuntu 18.04:
+
+check the repositories for the correct version if you are using a different OS:
+
+https://software.opensuse.org//download.html?project=security%3Azeek&package=zeek
+
+
+	echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_18.04/ /' | tee /etc/apt/sources.list.d/security:zeek.list
+
+We will download and store the gpg signature from the package for apt to read:
+
+	curl -fsSL http://download.opensuse.org/repositories/security:/zeek/xUbuntu_18.04/Release.key | gpg --dearmor | tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+
+Finally, we will update the package manager repositories and install zeek
+
+	apt-get update
+	apt-get -y install zeek
+
+To make sure that zeek can be found in the system we will add its link to a known path:
+
+	ln -s /opt/zeek/bin/zeek /usr/local/bin
+
+
+PS: Slips supports the latest zeek release by default, make sure you install it and not the LTS.
+
+#### Installing Redis v8
+
+Install redis v8 from source as it's not available it their official repositories.
+
+```
+curl -L https://download.redis.io/redis-stable.tar.gz -o /tmp/redis-stable.tar.gz \
+    && mkdir -p /redis-stable \
+    && tar xzf redis-stable.tar.gz -C / \
+    && cd /redis-stable \
+    && make distclean \
+    && make MALLOC=libc
+```
+
+Please remember to add /redis-stable/src to your PATH for slips to be able to use it.
+
+#### Redis authentication
+
+Slips requires every redis-server it starts to authenticate. The first time
+it needs one, it generates a random password and stores it at
+`permanent/redis_auth.conf` (mode `600`, readable only by the user running
+slips).
+
+This password is persistent across runs, it's what lets the
+long-lived cache database on port 6379 (below) keep working across
+restarts, and it's also the password used to log in to the web interface.
+
+You can retrieve it at any time with:
+
+```
+cat permanent/redis_auth.conf
+```
+
+Keep this file safe: anyone with read access to it can connect to any of
+your slips redis instances.
+
+
+#### Running Slips for the First Time
+
+
+Be aware that the first time you run Slips it will start updating
+all the databases and threat intelligence files in the background.
+However, it will give you as many detections as possible _while_ updating.
+You may have more detections if you rerun Slips after the updates.
+Slips behaves like this, so you don't have to wait for the updates to
+finish to have some detections. however, you can change that in the config file by setting ```wait_for_TI_to_finish``` to yes.
+
+
+Depending on the remote sites, downloading and updating the DB may take up to 4 minutes.
+Slips stores this information in a cache Redis database,
+which is kept in memory when Slips stops. Next time Slips runs, it will read from this database.
+The information in the DB is updated periodically according to the configuration file (usually one day).
+
+You can check if the DB is running this by looking at your processes:
+
+```
+    ps afx | grep redis
+    9078 ?        Ssl    1:25 redis-server *:6379
+```
+
+You can kill this redis database by running:
+
+```
+    ./slips.py -k
+    Choose which one to kill [0,1,2 etc..]
+    [0] Close all servers
+    [1] conn.log - port 6379
+```
+then choosing 1.
+
+After these steps, if you need optional submodules, initialize them with
+`git submodule update --init --recursive` and then follow the instructions in
+their own READMEs.
+
+
+
+
+----------
+----------
+----------
+# Installing Slips on a Raspberry PI
+
+The recommended way to install Slips on the RPI is using docker.
+
+If you're using the 64-bit (arm64) version of the RPI,
+follow the official docker [installation instructions for Debian](https://docs.docker.com/engine/install/debian/).
+
+## Enabling the memory protection for Docker
+The default raspbian image disables by default the memory protection that Docker needs.
+
+To test if your rpi is correctly configured you can do 
+
+	grep -qw memory /sys/fs/cgroup/cgroup.controllers && echo "PASS: memory cgroups enabled" || echo "FAIL: memory cgroups disabled"
+
+If your rpi is not correctly configured, you can correctly configured it with
+
+	sudo sed -i.bak '/cgroup_enable=memory/! s/[[:space:]]*$/ cgroup_enable=memory/' /boot/firmware/cmdline.txt
+	reboot
+
+## Running Slips' Docker in the Pi
+
+This command 
+
+	docker run --restart unless-stopped -d --cpu-shares "700" --memory="14g" --memory-swap="40g" --net=host --cap-add=NET_ADMIN -v $(pwd)/output:/StratosphereLinuxIPS/output --name slips_rpi stratosphereips/slips:latest /StratosphereLinuxIPS/slips.py -i eth0 -w -p -c config/slips.yaml -o output/slips_rpi
+
+The meaning of the parameters are:
+
+  - --restart unless-stopped
+    Restarts the container if it crashes, exits, Docker restarts, or the Pi reboots. It remains stopped if you explicitly stop it with docker stop.
+
+  - -d
+    Runs the container in detached/background mode. View its output with: `docker logs -f slips_rpi`
+
+  - --cpu-shares "700"
+    Gives the container a relative CPU weight of 700; Docker’s default is 1024. This is only a priority during CPU contention—it does not cap CPU consumption.
+
+  - --memory="14g"
+    Limits the container to 14 GiB of physical memory. If your Pi has 8GB of Mem, use 7g.
+
+  - --memory-swap="26g"
+    Allows 26 GiB total memory plus swap (this is not 40 GiB of swap). The theoretical swap allowance is roughtly double the memory you allowed.
+
+  - --net=host
+    Makes the container share the Pi’s network namespace instead of receiving a separate container IP. This allows Slips to monitor the host’s eth0 interface directly.
+
+  - --cap-add=NET_ADMIN
+    Allows processes inside the container to modify networking and firewall configuration. Slips needs this for -p blocking with the iptables firewall.
+
+  - -v $(pwd)/output:/StratosphereLinuxIPS/output
+    Creates a bind mount:
+      - $(pwd) expands to the current host directory.
+      - $(pwd)/output is the directory on the Pi.
+      - /StratosphereLinuxIPS/output is where it appears inside the container.
+
+    Slips results therefore survive container replacement. If you run the command from /home/pi, the host directory is /home/pi/output.
+
+  - --name slips_rpi
+    Names the container slips_rpi.
+
+  - stratosphereips/slips:latest
+    The Docker image.
+
+  Specific Slips command and options:
+
+  - /StratosphereLinuxIPS/slips.py
+    The program Docker launches inside the container.
+
+  - -i eth0
+    Captures and analyzes live traffic from eth0.
+
+  - -w
+    Starts the Slips web interface automatically.
+
+  - -p
+    Enables active blocking of malicious IP addresses. This is also required if you want ARP poisoning isolation of attackers, but it should also be enabled in the configuration.
+
+  - -c config/slips.yaml
+    Loads settings from /StratosphereLinuxIPS/config/slips.yaml inside the container.
+
+  - -o output/slips_rpi
+    Writes SLIPS results to /StratosphereLinuxIPS/output/slips_rpi. Because the parent output directory is bind-mounted, the files appear on the Pi at: $(pwd)/output/slips_rpi
+
+
+## Keep Slips always running in the Rpi
+To be sure that Slips starts every time your Pi boots, remember to run it with `--restart unless-stopped` and the to run
+
+	`sudo systemctl enable docker`
+
+
+
+
+--------------
+## Protect your local network with Slips on the RPI
+Optionally, Slips can be run in the Pi with a WiFi access point. Then your local devices can connect to that Wifi and be better protected by Slips since it can actively block attackers to your devices.
+
+![](images/immune/rpi_as_an_acces_point.jpeg)
+
+Configuration:
+1. Connect your RPI to your router using an ethernet cable (since the WiFi will be used for the AP)
+2. Install [linux-wifi-hotspot](https://github.com/lakinduakash/linux-wifi-hotspot/blob/master/src/scripts/README.md)
+3. Start the access point (in NAT mode)
+
+  `sudo create_ap wlan0 eth0 rpi_wifi changemysecurepassword -c 40`
+
+where `wlan0` is the wifi interface of your RPI, `eth0` is the ethernet interface and `-c 40` is the channel of the access point.
+
+We chose channel 40 because it is a 5GHz channel, which is faster and less crowded than the 2.4GHz channels.
+
+Note: Please make sure your RPI model supports 5GHz channels. If not, you can use `-c 1` for 2.4GHz.
+
+
+If all goes well you should see `wlan0: AP-ENABLED` in the output of the command.
+
+Check the [Debugging common AP errors](https://stratospherelinuxips.readthedocs.io/en/develop/immune/installing_slips_in_the_rpi.html#debugging-common-ap-errors) section if you have any issues.
+
+
+4. Run Slips in the RPI using the command below to listen to the traffic from the access point.
+
+```bash
+docker run --restart unless-stopped -d --cpu-shares "700" --memory="14g" --memory-swap="40g" --net=host --cap-add=NET_ADMIN -v $(pwd)/output:/StratosphereLinuxIPS/output --name slips_rpi stratosphereips/slips:latest /StratosphereLinuxIPS/slips.py -i wlan0 -w -p -c config/slips.yaml -o output/slips_rpi
+```
+
+Now connect your devices to the rpi_wifi with "changemysecurepassword" as the password, and enjoy the protection of Slips.

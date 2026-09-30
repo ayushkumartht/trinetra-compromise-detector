@@ -1,0 +1,584 @@
+# SPDX-FileCopyrightText: 2021 Sebastian Garcia <sebastian.garcia@agents.fel.cvut.cz>
+# SPDX-License-Identifier: GPL-2.0-only
+from datetime import datetime
+from typing import List, Dict
+import os.path
+import json
+import csv
+from dataclasses import asdict
+
+from slips_files.common.abstracts.isqlite import ISQLite
+from slips_files.common.output_paths import get_this_db_path_inside_output_dir
+from slips_files.common.printer import Printer
+from slips_files.common.slips_utils import utils
+from slips_files.core.structures.alerts import Alert
+from slips_files.core.structures.evidence import Evidence
+from slips_files.core.output import Output
+
+
+class SQLiteDB(ISQLite):
+    """
+    Stores all the flows slips reads and handles labeling them
+    Creates a new db and connects to it if there's none in the given output_dir
+    """
+
+    name = "sqlite_db"
+    _valid_table_names = frozenset(
+        {
+            "flows",
+            "altflows",
+            "alerts",
+            "evidence",
+            "evidence_flows",
+            "alert_evidence",
+        }
+    )
+
+    def __init__(self, logger: Output, output_dir: str, main_pid: int):
+        self.printer = Printer(logger, self.name)
+        self._flows_db = get_this_db_path_inside_output_dir(
+            output_dir, "flows.sqlite"
+        )
+
+        db_newly_created = False
+        if not os.path.exists(self._flows_db):
+            # db not created, mark it as first time accessing it so we can
+            # init tables once we connect
+            db_newly_created = True
+            self._init_db()
+        # connects to the db
+        super().__init__(self.name.lower(), main_pid, self._flows_db)
+
+        if db_newly_created:
+            self.init_tables()
+        else:
+            self._ensure_history_schema()
+
+    def _ensure_history_schema(self) -> None:
+        """Add durable detection tables when opening an older run database."""
+        table_schema = {
+            "evidence": "evidence_id TEXT PRIMARY KEY, evidence_time REAL, "
+            "profile_ip TEXT, timewindow TEXT, threat_level TEXT, "
+            "evidence_type TEXT, source_module TEXT, description TEXT, "
+            "confidence REAL, data TEXT, "
+            "whitelisted INTEGER DEFAULT 0",
+            "evidence_flows": "evidence_id TEXT, uid TEXT, "
+            "PRIMARY KEY (evidence_id, uid)",
+            "alert_evidence": "alert_id TEXT, evidence_id TEXT, "
+            "PRIMARY KEY (alert_id, evidence_id)",
+        }
+        for table_name, schema in table_schema.items():
+            self.create_table(table_name, schema)
+        self._ensure_detection_score_columns()
+        self._create_history_indexes()
+
+    def init_tables(self):
+        """creates the tables we're gonna use"""
+        table_schema = {
+            "flows": "uid TEXT PRIMARY KEY, flow TEXT, label TEXT, profileid "
+            "TEXT, twid TEXT, aid TEXT",
+            "altflows": "uid TEXT PRIMARY KEY, flow TEXT, label TEXT, "
+            "profileid TEXT, twid TEXT, flow_type TEXT",
+            "alerts": "alert_id TEXT PRIMARY KEY, alert_time REAL, ip_alerted "
+            "TEXT, timewindow TEXT, tw_start TEXT, tw_end TEXT, "
+            "label TEXT, accumulated_threat_level REAL, "
+            "accumulated_ratl REAL, risk_weight REAL",
+            "evidence": "evidence_id TEXT PRIMARY KEY, evidence_time REAL, "
+            "profile_ip TEXT, timewindow TEXT, threat_level TEXT, "
+            "evidence_type TEXT, source_module TEXT, description TEXT, "
+            "confidence REAL, data TEXT, "
+            "accumulated_threat_level REAL, accumulated_ratl REAL, "
+            "whitelisted INTEGER DEFAULT 0",
+            "evidence_flows": "evidence_id TEXT, uid TEXT, "
+            "PRIMARY KEY (evidence_id, uid)",
+            "alert_evidence": "alert_id TEXT, evidence_id TEXT, "
+            "PRIMARY KEY (alert_id, evidence_id)",
+        }
+        for table_name, schema in table_schema.items():
+            self.create_table(table_name, schema)
+        self._create_history_indexes()
+
+    def _ensure_detection_score_columns(self) -> None:
+        """Add Slips detector-score columns to older run databases."""
+        columns = {
+            "alerts": {
+                "accumulated_threat_level": "REAL",
+                "accumulated_ratl": "REAL",
+                "risk_weight": "REAL",
+            },
+            "evidence": {
+                "accumulated_threat_level": "REAL",
+                "accumulated_ratl": "REAL",
+                "whitelisted": "INTEGER DEFAULT 0",
+                "source_module": "TEXT",
+            },
+        }
+        for table_name, additions in columns.items():
+            existing = set(self.get_columns(table_name))
+            for column_name, column_type in additions.items():
+                if column_name not in existing:
+                    self.execute(
+                        f"ALTER TABLE {table_name} "
+                        f"ADD COLUMN {column_name} {column_type}"
+                    )
+
+    def _create_history_indexes(self) -> None:
+        """Create indexes needed for bounded historical web queries."""
+        indexes = (
+            "CREATE INDEX IF NOT EXISTS alerts_time_idx "
+            "ON alerts(alert_time DESC, alert_id)",
+            "CREATE INDEX IF NOT EXISTS alerts_ip_time_idx "
+            "ON alerts(ip_alerted, alert_time DESC, alert_id)",
+            "CREATE INDEX IF NOT EXISTS evidence_time_idx "
+            "ON evidence(evidence_time DESC, evidence_id)",
+            "CREATE INDEX IF NOT EXISTS evidence_profile_time_idx "
+            "ON evidence(profile_ip, evidence_time DESC, evidence_id)",
+            "CREATE INDEX IF NOT EXISTS evidence_whitelisted_tw_idx "
+            "ON evidence(profile_ip, timewindow, whitelisted)",
+            "CREATE INDEX IF NOT EXISTS evidence_type_idx "
+            "ON evidence(evidence_type, evidence_time DESC)",
+            "CREATE INDEX IF NOT EXISTS evidence_threat_idx "
+            "ON evidence(threat_level, evidence_time DESC)",
+            "CREATE INDEX IF NOT EXISTS evidence_flows_uid_idx "
+            "ON evidence_flows(uid)",
+            "CREATE INDEX IF NOT EXISTS alert_evidence_evidence_idx "
+            "ON alert_evidence(evidence_id)",
+        )
+        for statement in indexes:
+            self.execute(statement)
+
+    def _init_db(self):
+        """
+        creates the db if it doesn't exist and clears it if it exists
+        """
+        # make it accessible to root and non-root users, because when
+        # slips is started using sudo, it drops privs from modules that
+        # don't need them, and without this line, these modules wont be
+        # able to access the path_to_remote_ti_files
+        open(self._flows_db, "w").close()
+        os.chmod(self._flows_db, 0o777)
+
+    def get_db_path(self) -> str:
+        """
+        returns the path of the sqlite flows db placed in the output dir
+        """
+        return self._flows_db
+
+    def get_altflow_from_uid(self, uid) -> dict:
+        """Given a uid, get the alternative flow associated with it"""
+        altflow = self.select("altflows", condition="uid = ?", params=(uid,))
+        if altflow:
+            flow: str = altflow[0][1]
+            return json.loads(flow)
+        return False
+
+    def get_all_contacted_ips_in_profileid_twid(self, profileid, twid) -> dict:
+        all_flows: dict = self.get_all_flows_in_profileid_twid(profileid, twid)
+
+        if not all_flows:
+            return {}
+
+        contacted_ips = {}
+        for uid, flow in all_flows.items():
+            # get the daddr of this flow
+            daddr = flow["daddr"]
+            contacted_ips[daddr] = uid
+        return contacted_ips
+
+    def get_all_flows_in_profileid_twid(self, profileid, twid):
+        all_flows: list = self.select(
+            "flows",
+            condition="profileid = ? AND twid = ?",
+            params=(profileid, twid),
+        )
+        if not all_flows:
+            return False
+        res = {}
+        for flow in all_flows:
+            uid = flow[0]
+            flow = flow[1]
+            res[uid] = json.loads(flow)
+        return res
+
+    def get_all_altflows_in_profileid_twid(self, profileid, twid):
+        condition = f'profileid = "{profileid}" ' f'AND twid = "{twid}"'
+        altflows: list = self.select("altflows", condition=condition)
+        if not altflows:
+            return []
+
+        rows = []
+        for altflow in altflows:
+            rows.append(
+                {
+                    "uid": altflow[0],
+                    "flow": json.loads(altflow[1]),
+                    "label": altflow[2],
+                    "profileid": altflow[3],
+                    "twid": altflow[4],
+                    "flow_type": altflow[5],
+                }
+            )
+        return rows
+
+    def get_all_flows_in_profileid(self, profileid) -> Dict[str, dict]:
+        """
+        Return a list of all the flows in this profileid
+        [{'uid':flow},...]
+        """
+        flows = self.select(
+            "flows", condition="profileid = ?", params=(profileid,)
+        )
+        all_flows: Dict[str, dict] = {}
+        if flows:
+            for flow in flows:
+                uid = flow[0]
+                flow: str = flow[1]
+                all_flows[uid] = json.loads(flow)
+
+        return all_flows
+
+    def get_all_flows(self):
+        """
+        Returns a list with all the flows in all profileids and twids
+        Each element in the list is a flow
+        """
+        flows = self.select("flows")
+        flow_list = []
+        if flows:
+            for flow in flows:
+                flow_list.append(json.loads(flow[1]))
+        return flow_list
+
+    def set_flow_label(self, uids: List[str], new_label: str):
+        """
+        sets the given new_label to each flow in the uids list
+        """
+        for uid in uids:
+            # add the label to the flow (conn.log flow)
+            self.update(
+                "flows",
+                "label = ?",
+                "uid = ?",
+                params=(new_label, uid),
+            )
+            # add the label to the altflow (dns, http, whatever it is)
+            self.update(
+                "altflows",
+                "label = ?",
+                "uid = ?",
+                params=(new_label, uid),
+            )
+
+    def export_labeled_flows(self, output_dir, format):
+        if "tsv" in format:
+            csv_output_file = os.path.join(output_dir, "labeled_flows.tsv")
+            header: list = self.get_columns("flows")
+
+            with open(csv_output_file, "w", newline="") as tsv_file:
+                writer = csv.writer(tsv_file, delimiter="\t")
+
+                # write the header
+                writer.writerow(header)
+
+                # Fetch rows one by one and write them to the file
+                for row in self.iterate_flows():
+                    writer.writerow(row)
+
+        if "json" in format:
+            json_output_file = os.path.join(output_dir, "labeled_flows.json")
+
+            with open(json_output_file, "w", newline="") as json_file:
+                # Fetch rows one by one and write them to the file
+                for row in self.iterate_flows():
+                    json_labeled_flow = {
+                        "uid": row[0],
+                        "flow": row[1],
+                        "label": row[2],
+                        "profileid": row[3],
+                        "twid": row[4],
+                    }
+                    json.dump(json_labeled_flow, json_file)
+                    json_file.write("\n")
+
+    def get_columns(self, table) -> list:
+        """returns a list with column names in the given table"""
+        table = self._validate_table_name(table)
+        cursor = self.execute(f"PRAGMA table_info({table})")
+        columns = self.fetchall(cursor)
+        return [column[1] for column in columns]
+
+    def iterate_flows(self):
+        """returns an iterator"""
+
+        # generator function to iterate over the rows
+        def row_generator():
+            # select all flows and altflows
+            cursor = self.execute(
+                "SELECT * FROM flows UNION SELECT uid, flow, label, profileid,"
+                " twid FROM altflows"
+            )
+
+            while True:
+                row = self.fetchone(cursor)
+                if row is None:
+                    break
+                yield row
+
+        # Return the combined iterator
+        return iter(row_generator())
+
+    def get_flow(self, uid: str, twid=False) -> dict:
+        """
+        Returns the flow with the given uid
+        the flow returned is read from conn.log
+        """
+        params = [uid]
+        condition = "uid = ?"
+        if twid:
+            condition += " AND twid = ?"
+            params.append(twid)
+
+        res = self.select("flows", condition=condition, params=tuple(params))
+        res = res[0][1] if res else {}
+        return {uid: res}
+
+    def add_flow(self, flow, profileid: str, twid: str, label="benign"):
+        if hasattr(flow, "aid"):
+            parameters = (
+                profileid,
+                twid,
+                flow.uid,
+                json.dumps(asdict(flow)),
+                label,
+                flow.aid,
+            )
+            self.execute(
+                "INSERT OR REPLACE INTO flows (profileid, twid, uid, flow, label, aid) "
+                "VALUES (?, ?, ?, ?, ?, ?);",
+                parameters,
+            )
+        else:
+            parameters = (
+                profileid,
+                twid,
+                flow.uid,
+                json.dumps(asdict(flow)),
+                label,
+            )
+
+            self.execute(
+                "INSERT OR REPLACE INTO flows (profileid, twid, uid, flow, label) "
+                "VALUES (?, ?, ?, ?, ?);",
+                parameters,
+            )
+
+    def get_flows_count(self, profileid=None, twid=None) -> int:
+        """
+        returns the total number of flows
+         in the db for this profileid and twid if given
+        """
+        condition_parts = []
+        params = []
+        if profileid:
+            condition_parts.append("profileid = ?")
+            params.append(profileid)
+        if twid:
+            condition_parts.append("twid = ?")
+            params.append(twid)
+
+        condition = " AND ".join(condition_parts) if condition_parts else None
+
+        flows = self.get_count(
+            "flows", condition=condition, params=tuple(params)
+        )
+        # flows += self.get_count('altflows', condition=condition)
+        return flows
+
+    def _validate_table_name(self, table: str) -> str:
+        """
+        Validate table names used in SQLiteDB metadata queries.
+
+        :param table: Table name to validate.
+        :return: The validated table name.
+        """
+        if table not in self._valid_table_names:
+            raise ValueError(f"Invalid SQLiteDB table name: {table}")
+        return table
+
+    def add_altflow(self, flow, profileid: str, twid: str, label="benign"):
+        parameters = (
+            profileid,
+            twid,
+            flow.uid,
+            json.dumps(asdict(flow)),
+            label,
+            flow.type_,
+        )
+        self.execute(
+            "INSERT OR REPLACE INTO altflows (profileid, twid, uid, "
+            "flow, label, flow_type) "
+            "VALUES (?, ?, ?, ?, ?, ?);",
+            parameters,
+        )
+
+    def _execute_detection_transaction(
+        self, statements: List[tuple[str, tuple]]
+    ) -> None:
+        """
+        Execute one atomic group of durable detection writes.
+
+        Parameters:
+            statements: SQL statements and their bound parameters.
+        """
+        with self.conn_lock:
+            with self._acquire_flock():
+                try:
+                    cursor = self.conn.cursor()
+                    cursor.execute("BEGIN")
+                    for query, parameters in statements:
+                        cursor.execute(query, parameters)
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+
+    def add_evidence(self, evidence: Evidence) -> None:
+        """
+        Persist evidence and its triggering flow identifiers.
+
+        Parameters:
+            evidence: Canonical evidence generated by Slips.
+        """
+        serialized = json.dumps(utils.to_dict(evidence))
+        evidence_time = utils.convert_ts_format(
+            evidence.timestamp, "unixtimestamp"
+        )
+        statements = [
+            (
+                "INSERT OR REPLACE INTO evidence "
+                "(evidence_id, evidence_time, profile_ip, timewindow, "
+                "threat_level, evidence_type, source_module, description, "
+                "confidence, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    evidence.id,
+                    evidence_time,
+                    evidence.profile.ip,
+                    str(evidence.timewindow),
+                    str(evidence.threat_level),
+                    str(evidence.evidence_type),
+                    getattr(evidence, "source_module", ""),
+                    evidence.description,
+                    evidence.confidence,
+                    serialized,
+                ),
+            ),
+            (
+                "DELETE FROM evidence_flows WHERE evidence_id = ?",
+                (evidence.id,),
+            ),
+        ]
+        statements.extend(
+            (
+                "INSERT OR IGNORE INTO evidence_flows "
+                "(evidence_id, uid) VALUES (?, ?)",
+                (evidence.id, uid),
+            )
+            for uid in evidence.uid
+        )
+        self._execute_detection_transaction(statements)
+
+    def mark_evidence_whitelisted(self, evidence_id: str) -> None:
+        """
+        Persist that Evidence Handler excluded an evidence by whitelist.
+
+        Parameters:
+            evidence_id: Canonical evidence identifier.
+        """
+        self.execute(
+            "UPDATE evidence SET whitelisted = 1 WHERE evidence_id = ?",
+            (evidence_id,),
+        )
+
+    def is_evidence_whitelisted(self, evidence_id: str) -> bool:
+        """
+        Returns True if the given evidence_id was marked as whitelisted.
+        """
+        res = self.select(
+            "evidence",
+            columns="whitelisted",
+            condition="evidence_id = ?",
+            params=(evidence_id,),
+            limit=1,
+        )
+        return bool(res) and res[0] == 1
+
+    def get_whitelisted_evidence_ids_in_tw(
+        self, profile_ip: str, twid: str
+    ) -> set:
+        """
+        Returns the IDs of all evidence marked as whitelisted for the given
+        profile IP and timewindow, in a single indexed query.
+        """
+        res = self.select(
+            "evidence",
+            columns="evidence_id",
+            condition="profile_ip = ? AND timewindow = ? AND whitelisted = 1",
+            params=(profile_ip, twid),
+        )
+        return {row[0] for row in res} if res else set()
+
+    def add_alert(self, alert: Alert) -> None:
+        """
+        Persist an alert and its evidence relationships.
+
+        Parameters:
+            alert: Canonical alert generated by Slips.
+        """
+        now = utils.convert_ts_format(datetime.now(), "unixtimestamp")
+        statements = [
+            (
+                "INSERT OR REPLACE INTO alerts "
+                "(alert_id, ip_alerted, timewindow, tw_start, tw_end, "
+                "label, alert_time, accumulated_threat_level, "
+                "accumulated_ratl, risk_weight) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    alert.id,
+                    alert.profile.ip,
+                    str(alert.timewindow),
+                    alert.timewindow.start_time,
+                    alert.timewindow.end_time,
+                    "malicious",
+                    now,
+                    getattr(alert, "accumulated_threat_level", None),
+                    getattr(alert, "accumulated_ratl", None),
+                    (
+                        alert.risk_level.weight
+                        if getattr(alert, "risk_level", None)
+                        else None
+                    ),
+                ),
+            ),
+            (
+                "DELETE FROM alert_evidence WHERE alert_id = ?",
+                (alert.id,),
+            ),
+        ]
+        statements.extend(
+            (
+                "INSERT OR IGNORE INTO alert_evidence "
+                "(alert_id, evidence_id) VALUES (?, ?)",
+                (alert.id, evidence_id),
+            )
+            for evidence_id in alert.correl_id
+        )
+        self._execute_detection_transaction(statements)
+
+    def get_malicious_profiles(self) -> List[str]:
+        """
+        returns a list with unique ip_alerted values from alerts table
+        """
+        results = self.select("alerts", columns="DISTINCT ip_alerted")
+        if not results:
+            return []
+        return [row[0] for row in results if row and row[0] is not None]

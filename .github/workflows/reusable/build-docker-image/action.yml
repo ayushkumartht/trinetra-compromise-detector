@@ -1,0 +1,57 @@
+name: "Build Docker Image"
+description: "Build docker/Dockerfile, export it as an artifact, and expose the image tag"
+inputs:
+  artifact_name:
+    description: "Artifact name for the exported Docker image tarball"
+    required: true
+  dockerfile:
+    description: "Path to the Dockerfile"
+    required: false
+    default: "docker/Dockerfile"
+  image_tag:
+    description: "Docker image tag to build and export"
+    required: true
+outputs:
+  artifact_name:
+    description: "Artifact name for the exported Docker image tarball"
+    value: ${{ inputs.artifact_name }}
+  image_tag:
+    description: "Docker image tag that was built"
+    value: ${{ inputs.image_tag }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout repository with submodules
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.ref }}
+        fetch-depth: 0
+        submodules: recursive
+
+    - name: Validate Docker build context
+      shell: bash
+      run: |
+        test -f iris/go.mod
+        test -f iris/go.sum
+        test -f p2p4slips/go.mod
+        test -f p2p4slips/go.sum
+
+    - name: Build Docker image
+      shell: bash
+      env:
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        IMAGE_TAG: ${{ inputs.image_tag }}
+        SLIPS_GIT_REF: ${{ github.sha }}
+      run: |
+        # Pin the in-Dockerfile git clone to the exact commit being tested,
+        # rather than whatever the default branch happens to point to at
+        # the moment BuildKit runs the clone.
+        docker build -t "$IMAGE_TAG" -f "$DOCKERFILE" --build-arg SLIPS_GIT_REF="$SLIPS_GIT_REF" .
+        docker save -o docker-image.tar "$IMAGE_TAG"
+
+    - name: Upload Docker image
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: docker-image.tar

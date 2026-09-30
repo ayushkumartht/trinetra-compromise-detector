@@ -1,0 +1,613 @@
+# SPDX-FileCopyrightText: 2021 Sebastian Garcia <sebastian.garcia@agents.fel.cvut.cz>
+# SPDX-License-Identifier: GPL-2.0-only
+import sqlite3
+import re
+from contextlib import contextmanager
+from importlib.util import find_spec
+from pathlib import Path
+import fcntl
+import os
+import shutil
+import binascii
+import subprocess
+import base64
+import signal
+import sys
+import socket
+import threading
+import time
+from typing import (
+    Dict,
+    Optional,
+)
+from pathlib import PosixPath
+from unittest.mock import Mock
+import yaml
+
+IS_IN_A_DOCKER_CONTAINER = os.environ.get("IS_IN_A_DOCKER_CONTAINER", False)
+
+integration_tests_dir = "output/integration_tests/"
+alerts_file = "alerts.log"
+INTEGRATION_TEST_PORT_START = 65000
+INTEGRATION_TEST_PORT_END = 65535
+_port_lock = threading.Lock()
+_next_integration_test_port = INTEGRATION_TEST_PORT_START
+_integration_test_port_counter_file = (
+    Path(integration_tests_dir) / ".next-port"
+)
+_integration_test_port_lock_file = (
+    Path(integration_tests_dir) / ".port-allocator.lock"
+)
+
+# create the integration tests dir
+if not os.path.exists(integration_tests_dir):
+    path = Path(integration_tests_dir)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def modify_yaml_config(
+    input_path="config/slips.yaml",
+    output_filename="updated_slips.yaml",
+    output_dir=None,
+    changes=None,
+):
+    """
+    Reads a YAML config file, modifies specified values, and writes the new
+     config to the current directory.
+
+    :param input_path: path to the input yaml file
+    :param output_filename: name of the output yaml file
+    :param output_dir: name of the output directory wher eyou want your
+    generated yaml file to be. if none, the generated yaml file will be in
+    the cwd
+    :param changes: dictionary containing keys to update and their new values
+    """
+    input_file = Path(input_path)
+    if output_dir:
+        output_file = Path(output_dir) / output_filename
+    else:
+        output_file = Path.cwd() / output_filename
+
+    if not input_file.exists():
+        raise FileNotFoundError(f"YAML config file not found: {input_path}")
+
+    with input_file.open("r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    if changes:
+        for key, value in changes.items():
+            if (
+                key in config
+                and isinstance(config[key], dict)
+                and isinstance(value, dict)
+            ):
+                config[key].update(value)
+            else:
+                config[key] = value
+
+    with output_file.open("w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+
+    return output_file
+
+
+def get_mock_coro(return_value):
+    """
+    instead of doing async_func = Mock() which doesn't work
+    you should use this function to mock it
+    so async_func = get_mock_coro(x)
+    """
+
+    async def mock_coro(*args, **kwargs):
+        return return_value
+
+    return Mock(wraps=mock_coro)
+
+
+def do_nothing(*args):
+    """Used to override the print function because using the self.print causes broken pipes"""
+    pass
+
+
+def run_slips(cmd, timeout=300):
+    """
+    runs slips and waits for it to end, or kills it after timeout
+    seconds (default 5 mins) so a hung slips process can't hang the
+    whole test suite. Raises subprocess.TimeoutExpired on timeout.
+    """
+    slips = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, shell=True, start_new_session=True
+    )
+    try:
+        slips.communicate(input=b"y\n", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # cmd runs in a shell, so killing slips.pid alone would only
+        # kill the shell and leave slips and its child processes
+        # running; kill the whole process group instead.
+        os.killpg(os.getpgid(slips.pid), signal.SIGKILL)
+        slips.communicate()
+
+    return slips.returncode
+
+
+@contextmanager
+def integration_test_port_file_lock():
+    """
+    Lock the shared integration-test port allocator across processes.
+
+    :return: Yields while the allocator lock is held
+    """
+    _integration_test_port_lock_file.touch(exist_ok=True)
+    with _integration_test_port_lock_file.open(
+        "r", encoding="utf-8"
+    ) as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def get_next_integration_test_port_candidate() -> int:
+    """
+    Read the next shared integration-test port candidate.
+
+    :return: Next candidate port from the shared counter
+    """
+    if not _integration_test_port_counter_file.exists():
+        return max(_next_integration_test_port, INTEGRATION_TEST_PORT_START)
+
+    counter_value = _integration_test_port_counter_file.read_text(
+        encoding="utf-8"
+    ).strip()
+    return int(counter_value or INTEGRATION_TEST_PORT_START)
+
+
+def set_next_integration_test_port_candidate(next_port: int) -> None:
+    """
+    Persist the next shared integration-test port candidate.
+
+    :param next_port: Next port to hand out
+    :return: None
+    """
+    global _next_integration_test_port
+
+    _next_integration_test_port = next_port
+    _integration_test_port_counter_file.write_text(
+        str(next_port), encoding="utf-8"
+    )
+
+
+def is_integration_test_port_available(port: int) -> bool:
+    """
+    Check whether a TCP port is currently available on localhost.
+
+    :param port: TCP port to probe
+    :return: True when the port can be bound, otherwise False
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+
+    return True
+
+
+def find_available_integration_test_port(start_port: int) -> int:
+    """
+    Find the next available integration-test port in the configured range.
+
+    :param start_port: Port number to start scanning from
+    :return: First available TCP port in the integration-test range
+    :raises RuntimeError: When the configured integration-test range is exhausted
+    """
+    for candidate in range(start_port, INTEGRATION_TEST_PORT_END + 1):
+        if is_integration_test_port_available(candidate):
+            return candidate
+
+    raise RuntimeError(
+        "No free integration test ports remain in the 65000-65535 range."
+    )
+
+
+def get_available_integration_test_port() -> int:
+    """
+    Return a free TCP port reserved from the integration test range.
+
+    The allocator walks ports from 65000 upwards and verifies each candidate
+    by binding to it before returning it. Allocation is synchronized across
+    pytest-xdist workers through a shared lock file and counter file.
+
+    :return: Available TCP port for an integration test
+    :raises RuntimeError: When the configured integration test port range is exhausted
+    """
+    with _port_lock:
+        with integration_test_port_file_lock():
+            candidate = get_next_integration_test_port_candidate()
+            port = find_available_integration_test_port(candidate)
+            set_next_integration_test_port_candidate(port + 1)
+            return port
+
+
+def allocate_integration_test_port(test_name: str, port_label: str) -> int:
+    """
+    Allocate and announce a free TCP port for an integration test.
+
+    :param test_name: Pytest node id or other human-readable test identifier
+    :param port_label: Label describing how the port will be used
+    :return: Allocated TCP port
+    """
+    port = get_available_integration_test_port()
+    print(f"[integration-test] {test_name} using {port_label} port {port}")
+    return port
+
+
+def is_tcp_port_open(port: int) -> bool:
+    """
+    Check whether a localhost TCP port is accepting connections.
+
+    :param port: TCP port to probe
+    :return: True when the port is accepting connections
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        try:
+            sock.connect(("127.0.0.1", port))
+        except OSError:
+            return False
+
+    return True
+
+
+def start_test_redis_server(
+    redis_port: int, output_dir, require_auth: bool = False
+) -> None:
+    """
+    Start the Redis server used by an integration test.
+
+    The server is daemonized (see config/redis.conf.template), so this
+    function returns once the server is confirmed to be listening.
+
+    :param redis_port: Redis port allocated for the test
+    :param output_dir: Test output directory, redis logs/data are stored in
+        an output_dir/redis subdirectory
+    :param require_auth: Include the shared redis_auth.conf (see
+        slips_files/core/database/redis_db/redis_auth.py) so the server
+        requires the same password every slips-managed redis-server does.
+        Needed by tests exercising modules (e.g. Iris) whose redis client
+        always authenticates and can't fall back to a password-less
+        connection.
+    :raises RuntimeError: When the server fails to start or never listens
+    """
+    output_dir = Path(output_dir)
+    redis_dir = output_dir / "redis"
+    redis_dir.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        "redis-server",
+        "config/redis.conf.template",
+        "--port",
+        str(redis_port),
+        "--bind",
+        "127.0.0.1",
+        "--dir",
+        str(redis_dir),
+        "--dbfilename",
+        "dump.rdb",
+        "--logfile",
+        f"redis-server-port-{redis_port}.log",
+    ]
+
+    if require_auth:
+        from slips_files.core.database.redis_db.redis_auth import (
+            ensure_redis_password,
+            get_redis_auth_conf_path,
+        )
+
+        ensure_redis_password()
+        command[2:2] = ["--include", get_redis_auth_conf_path()]
+
+    process = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if process.returncode != 0 and not is_tcp_port_open(redis_port):
+        raise RuntimeError(
+            "Failed to start redis-server for integration test "
+            f"on port {redis_port}: {process.stderr or process.stdout}"
+        )
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if is_tcp_port_open(redis_port):
+            return
+        time.sleep(0.2)
+
+    raise RuntimeError(
+        f"Timed out waiting for redis-server on port {redis_port}."
+    )
+
+
+def allocate_started_redis_port(
+    integration_port_factory,
+    output_dir,
+    port_label: str = "redis",
+    max_attempts: int = 5,
+    require_auth: bool = False,
+) -> int:
+    """
+    Allocate a Redis port, start a Redis server on it, and retry with a new
+    port when startup fails.
+
+    This is the entrypoint integration tests should use: it guarantees a
+    listening Redis server before the test (and Slips) tries to connect. If a
+    server can't be opened on the allocated port, another port is allocated
+    and the server is opened there instead.
+
+    :param integration_port_factory: Callable that allocates integration-test
+        ports (the ``integration_port_factory`` fixture)
+    :param output_dir: Test output directory used to store redis logs/data
+    :param port_label: Label describing the allocated port
+    :param max_attempts: Maximum number of Redis startup attempts
+    :param require_auth: See start_test_redis_server.
+    :return: Redis port that was successfully started
+    :raises RuntimeError: When no server could be started after max_attempts
+    """
+    last_error = None
+
+    for _ in range(max_attempts):
+        redis_port = integration_port_factory(port_label)
+        try:
+            start_test_redis_server(
+                redis_port, output_dir, require_auth=require_auth
+            )
+            return redis_port
+        except RuntimeError as error:
+            last_error = error
+            print(
+                "Failed to start redis-server for integration test on "
+                f"port {redis_port}. Retrying with a new port."
+            )
+
+    raise RuntimeError(
+        "Failed to start redis-server for integration test after "
+        f"{max_attempts} attempts: {last_error}"
+    )
+
+
+def get_slips_test_command(arguments):
+    """
+    Build a Slips CLI command that uses the current Python interpreter.
+
+    :param arguments: CLI arguments to pass to slips.py
+    :return: shell command string
+    """
+    return f"{sys.executable} ./slips.py {arguments}"
+
+
+def create_config_without_ti_update(output_dir) -> PosixPath:
+    """
+    Creates a slips config that disables the feeds_update_manager, so
+    tests that don't check TI detections don't wait for the TI feeds
+    download when slips is stopping.
+
+    :param output_dir: directory to store the generated config in
+    :return: path to the generated config file
+    """
+    return modify_yaml_config(
+        output_filename="no_ti_update_slips.yaml",
+        output_dir=output_dir,
+        changes={"modules": {"disable": ["template", "feeds_update_manager"]}},
+    )
+
+
+def get_random_uid():
+    return base64.b64encode(binascii.b2a_hex(os.urandom(9))).decode("utf-8")
+
+
+def get_total_profiles(db):
+    return int(db.scard("profiles"))
+
+
+def is_evidence_present(log_file, expected_evidence):
+    """Function to read the log file line by line and returns when it finds
+    the expected evidence"""
+    with open(log_file, "r") as f:
+        while line := f.readline():
+            if expected_evidence in line:
+                return True
+        # evidence not found in any line
+        return False
+
+
+def create_output_dir(dirname) -> PosixPath:
+    """
+    creates this output dir inside output/integration_tests/
+    returns a full path to the created output dir
+    """
+
+    path = Path(os.path.join(integration_tests_dir, dirname))
+    # clear output dir before running the test
+    if os.path.exists(path):
+        shutil.rmtree(path)
+
+    path.mkdir(parents=True, exist_ok=True)
+
+    return path
+
+
+def skip_if_missing_runtime_dependencies(
+    python_modules=None, binaries=None, require_zeek_or_bro=False
+):
+    """
+    Skip an integration test when required runtime dependencies are missing.
+
+    :param python_modules: iterable of importable module names
+    :param binaries: iterable of executable names expected on PATH
+    :param require_zeek_or_bro: require either zeek or bro to exist
+    :return: None
+    """
+    python_modules = python_modules or ()
+    binaries = binaries or ()
+    missing_dependencies = []
+
+    for module_name in python_modules:
+        if find_spec(module_name) is None:
+            missing_dependencies.append(module_name)
+
+    for binary_name in binaries:
+        if shutil.which(binary_name) is None:
+            missing_dependencies.append(binary_name)
+
+    if require_zeek_or_bro and not (
+        shutil.which("zeek") or shutil.which("bro")
+    ):
+        missing_dependencies.append("zeek|bro")
+
+    if missing_dependencies:
+        missing = ", ".join(missing_dependencies)
+        import pytest
+
+        pytest.skip(f"Missing integration runtime dependencies: {missing}")
+
+
+def msgs_published_are_eq_msgs_received_by_each_module(db) -> bool:
+    """
+    This functions checks that all modules received all msgs that were
+    published for the channels they subscribed to
+    """
+    for module in db.get_enabled_modules():
+        # get channels subscribed to by this module
+        msg_tracker: Dict[str, int] = db.get_msgs_received_at_runtime(module)
+
+        for channel, msgs_received in msg_tracker.items():
+            msgs_received: int
+            channel: str
+            assert db.get_msgs_published_in_channel(channel) == msgs_received
+
+        return True
+
+
+def check_for_text(txt, output_dir):
+    """function to parse slips_output file and check for a given string"""
+    slips_output = os.path.join(output_dir, "slips_output.txt")
+    with open(slips_output, "r") as f:
+        for line in f:
+            if txt in line:
+                return True
+    return False
+
+
+def get_total_analyzed_ips_from_output(output_dir) -> int:
+    """
+    Return the highest total analyzed IP count printed by Slips.
+
+    Parameters:
+        output_dir: Integration test output directory.
+
+    Return value:
+        Highest total analyzed IP count found in slips_output.txt.
+    """
+    slips_output = os.path.join(output_dir, "slips_output.txt")
+    total_ips = 0
+    pattern = re.compile(r"Total analyzed IPs:\s*(\d+)")
+    with open(slips_output, "r") as f:
+        for line in f:
+            if match := pattern.search(line):
+                total_ips = max(total_ips, int(match.group(1)))
+    return total_ips
+
+
+def get_label_count_from_output_db(output_dir, label):
+    """
+    Return the number of flows stored with a given label in SQLite.
+
+    :param output_dir: integration test output directory
+    :param label: flow label to count
+    :return: number of matching flows
+    """
+    db_path = os.path.join(output_dir, "databases", "flows.sqlite")
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM flows WHERE label = ?", (label,)
+        ).fetchone()
+    return int(row[0] or 0)
+
+
+def has_error_keywords(line):
+    """
+    these keywords indicate that an error needs to
+    be fixed and should fail the integration tests when found
+    """
+    error_keywords = ("<class", "error", "Error", "Traceback")
+    for keyword in error_keywords:
+        if keyword in line or keyword.lower() in line:
+            return True
+    return False
+
+
+def has_ignored_errors(line):
+    """
+    These are connection errors, empty feeds, download errors etc that don't
+    indicate that something is wrong with slips code
+    we shouldn't fail integration tests bc of them
+    """
+    ignored_error_keywords = (
+        "Connection error",
+        "while downloading",
+        "Error while reading the TI file",
+        "Error parsing feed",
+        "failed call to cuInit",
+        "SIGTERM",
+    )
+    for ignored_keyword in ignored_error_keywords:
+        if ignored_keyword in line:
+            return True
+
+
+def read_file_if_small(file_path) -> Optional[str]:
+    """
+    returns all contents of a  given file if the file size is < 3MBs
+    """
+    if not os.path.isfile(file_path):
+        print(f"File {file_path} does not exist.")
+        return None
+
+    # in bytes
+    file_size = os.path.getsize(file_path)
+
+    # Check if the file size is less than 3MB (3 * 1024 * 1024 bytes)
+    if file_size < 3 * 1024 * 1024:
+        with open(file_path, "r") as file:
+            contents = file.read()
+        return contents
+    else:
+        print(f"File {file_path} size exceeds 3MB.")
+        return None
+
+
+def assert_no_errors(output_dir):
+    """function to parse slips_output file and check for errors"""
+    error_files = ("slips_output.txt", "errors.log")
+    error_files = [os.path.join(output_dir, file) for file in error_files]
+
+    # we can't redirect stderr to a file and check it because we catch all
+    # exceptions in slips
+    for file in error_files:
+        with open(file, "r") as f:
+            for line in f:
+                if has_ignored_errors(line):
+                    continue
+                # prints the content of errors.log if one line was found to
+                # have an error. (only if the file is < 3MB) to avoid
+                # reading large files
+                # the goal of this is to be able to view the error from CI
+                # without having to download the artifacts
+                assert not has_error_keywords(
+                    line
+                ), f"file: {file} {read_file_if_small(file) or line}"

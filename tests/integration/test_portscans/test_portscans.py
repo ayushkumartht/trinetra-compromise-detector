@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: 2021 Sebastian Garcia <sebastian.garcia@agents.fel.cvut.cz>
+# SPDX-License-Identifier: GPL-2.0-only
+import pytest
+import shutil
+import os
+
+from tests.common_test_utils import (
+    run_slips,
+    is_evidence_present,
+    create_output_dir,
+    allocate_started_redis_port,
+    assert_no_errors,
+    get_slips_test_command,
+    create_config_without_ti_update,
+    get_total_analyzed_ips_from_output,
+    skip_if_missing_runtime_dependencies,
+)
+
+alerts_file = "alerts.log"
+
+
+@pytest.mark.parametrize(
+    "path,  output_dir",
+    [
+        (
+            "dataset/port-scans/horizontal/conn.log",
+            "testing_horizontal_ps/",
+        )
+    ],
+)
+def test_horizontal(
+    path,
+    output_dir,
+    integration_port_factory,
+    tmp_path,
+):
+    """
+    checks that slips is detecting horizontal ps no issue,
+    """
+    skip_if_missing_runtime_dependencies(
+        python_modules=("termcolor",), binaries=("redis-server",)
+    )
+    output_dir = create_output_dir(output_dir)
+    redis_port = allocate_started_redis_port(
+        integration_port_factory, output_dir
+    )
+    success = False
+    try:
+        expected_evidence = (
+            "Horizontal port scan to port http 80/tcp. From 10.0.2.112"
+        )
+
+        output_file = os.path.join(output_dir, "slips_output.txt")
+        config_file = create_config_without_ti_update(tmp_path)
+        command = get_slips_test_command(
+            f"-e 1 -t -f {path} -o {output_dir} "
+            f"-c {config_file} -P {redis_port}"
+        )
+        command = f"{command} > {output_file} 2>&1"
+        # this function returns when slips is done
+        run_slips(command)
+
+        assert_no_errors(output_dir)
+        profiles = get_total_analyzed_ips_from_output(output_dir)
+        assert profiles > 0
+
+        log_file = output_dir / "alerts" / alerts_file
+        assert is_evidence_present(log_file, expected_evidence)
+        success = True
+    finally:
+        if success:
+            shutil.rmtree(output_dir)
+
+
+@pytest.mark.parametrize(
+    "path, output_dir",
+    [("dataset/port-scans/vertical/conn.log", "testing_vertical_ps/")],
+)
+def test_vertical(
+    path,
+    output_dir,
+    integration_port_factory,
+    tmp_path,
+):
+    """
+    checks that slips is detecting horizontal ps no issue,
+    """
+    skip_if_missing_runtime_dependencies(
+        python_modules=("termcolor",), binaries=("redis-server",)
+    )
+    output_dir = create_output_dir(output_dir)
+    redis_port = allocate_started_redis_port(
+        integration_port_factory, output_dir
+    )
+    success = False
+    try:
+        expected_evidence = (
+            "vertical port scan to IP 45.33.32.156 from 192.168.1.9."
+        )
+
+        output_file = os.path.join(output_dir, "slips_output.txt")
+        config_file = create_config_without_ti_update(tmp_path)
+        command = get_slips_test_command(
+            f"-e 1 -t -f {path} -o {output_dir} "
+            f"-c {config_file} -P {redis_port}"
+        )
+        command = f"{command} > {output_file} 2>&1"
+        # this function returns when slips is done
+        run_slips(command)
+
+        assert_no_errors(output_dir)
+
+        profiles = get_total_analyzed_ips_from_output(output_dir)
+        assert profiles > 0
+
+        log_file = output_dir / "alerts" / alerts_file
+        assert is_evidence_present(log_file, expected_evidence)
+        success = True
+    finally:
+        if success:
+            shutil.rmtree(output_dir)

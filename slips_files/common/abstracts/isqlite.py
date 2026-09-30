@@ -1,0 +1,291 @@
+import re
+import sqlite3
+from abc import ABC
+from contextlib import contextmanager
+from threading import Lock
+from time import sleep
+
+from slips_files.common.sqlite_flock import SQLiteFlock
+
+
+class ISQLite(ABC):
+    """
+    Interface for SQLite database operations.
+    Any sqlite db that slips connects to should use thisinterface for
+    avoiding common sqlite errors
+
+    PS: if you're gonna use cursor.anything, please always create a new cursor
+    to avoid shared-cursor bugs from sqlite.
+    and use the conn_lock whenever you're accessing self.conn
+    """
+
+    # to avoid multi threading errors where multiple threads try to write to
+    # the same sqlite db at the same time this lock must be used because
+    # we're using check_same_thread=False in sqlite3.connect()
+    conn_lock = Lock()
+    _identifier_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    def __init__(self, name: str, main_pid: int, db_file: str):
+        """
+        :param name: the name of the sqlite db, used to create a lock file
+        :param main_pid: the pid of slips.py, used to create a lock file to
+         make sure only 1 lockfile is created per slips run per sqlite db
+        """
+        # the lock file itself is created world read/write (see
+        # SQLiteFlock._ensure_lockfile) so that both root and non-root
+        # slips modules can use it regardless of which one creates it
+        # (because some modules drop privs when slips runs with -p and
+        # others dont), without needing to juggle process privileges here.
+        self._init_flock(name, main_pid)
+        self.connect(db_file)
+        self._enable_wal_mode()
+
+    def connect(self, db_file: str):
+        """creates the sqlite db if it doesn't exist, and connects to it"""
+        with self._acquire_flock():
+            self.conn = sqlite3.connect(
+                db_file, check_same_thread=False, timeout=20
+            )
+
+    def _init_flock(self, name: str, main_pid: int):
+        """
+        Initialize the lock file used for inter-process SQLite access.
+
+        Parameters:
+        name: Logical database name used in the lock file name.
+        main_pid: Main Slips process PID used to namespace the lock file.
+        """
+        self.sqlite_flock = SQLiteFlock(name=name, main_pid=main_pid)
+        self.lockfile_path = self.sqlite_flock.lockfile_path
+
+    def _enable_wal_mode(self):
+        """
+        Enables Write-Ahead Logging (WAL) and sets synchronous mode to FULL.
+        WAL is required for safe multi-process access to the SQLite database,
+         to avoid the "DB is locked" error
+        FULL synchronous ensures durability and avoids 'database is
+        malformed' errors.
+        """
+        with self._acquire_flock():
+            # Don't use self.execute — this must not be in a transaction.
+            with self.conn_lock:
+                self.conn.execute("PRAGMA journal_mode=WAL;")
+                self.conn.execute("PRAGMA synchronous=FULL;")
+
+    @contextmanager
+    def _acquire_flock(self):
+        """Context manager for acquiring and releasing the file lock."""
+        with self.sqlite_flock.acquire():
+            yield
+
+    def print(self, *args, **kwargs):
+        return self.printer.print(*args, **kwargs)
+
+    def _validate_identifier(self, identifier: str, kind: str = "identifier"):
+        """
+        Validate a SQL identifier before interpolating it into a query.
+
+        :param identifier: Identifier to validate.
+        :param kind: Human-readable identifier type for error messages.
+        :return: The validated identifier.
+        """
+        if not isinstance(
+            identifier, str
+        ) or not self._identifier_pattern.fullmatch(identifier):
+            raise ValueError(f"Invalid SQL {kind}: {identifier}")
+        return identifier
+
+    def _validate_identifier_list(
+        self, identifiers: str, kind: str = "identifier list"
+    ) -> str:
+        """
+        Validate a comma-separated list of SQL identifiers.
+
+        :param identifiers: Comma-separated identifiers.
+        :param kind: Human-readable identifier type for error messages.
+        :return: The normalized identifier list.
+        """
+        validated_identifiers = []
+        for identifier in identifiers.split(","):
+            validated_identifiers.append(
+                self._validate_identifier(identifier.strip(), kind)
+            )
+        return ", ".join(validated_identifiers)
+
+    def get_number_of_tables(self):
+        """
+        returns the number of tables in the current db
+        """
+        condition = "type='table'"
+        res = self.select(
+            "sqlite_master", columns="count(*)", condition=condition, limit=1
+        )
+        return res[0]
+
+    def create_table(self, table_name, schema):
+        table_name = self._validate_identifier(table_name, "table name")
+        query = f"CREATE TABLE IF NOT EXISTS {table_name} ({schema})"
+        self.execute(query)
+
+    def insert(self, table_name, values: tuple, columns: str = None):
+        table_name = self._validate_identifier(table_name, "table name")
+        if columns:
+            columns = self._validate_identifier_list(columns, "column name")
+            placeholders = ", ".join(["?"] * len(values))
+            query = (
+                f"INSERT INTO {table_name} ({columns}) "
+                f"VALUES ({placeholders})"
+            )
+            self.execute(query, values)
+        else:
+            query = f"INSERT INTO {table_name} VALUES {values}"  # fallback
+            self.execute(query)
+
+    def update(self, table_name, set_clause, condition, params=None):
+        table_name = self._validate_identifier(table_name, "table name")
+        query = f"UPDATE {table_name} SET {set_clause} WHERE {condition}"
+        self.execute(query, params)
+
+    def delete(self, table_name, condition, params=None):
+        table_name = self._validate_identifier(table_name, "table name")
+        query = f"DELETE FROM {table_name} WHERE {condition}"
+        self.execute(query, params)
+
+    def select(
+        self,
+        table_name,
+        columns="*",
+        condition=None,
+        params=(),
+        order_by=None,
+        limit: int = None,
+    ):
+        table_name = self._validate_identifier(table_name, "table name")
+        query = f"SELECT {columns} FROM {table_name} "
+        if condition:
+            query += f" WHERE {condition}"
+        if order_by:
+            query += f" ORDER BY {order_by}"
+        if params:
+            cursor = self.execute(query, params)
+        else:
+            cursor = self.execute(query)
+
+        if not cursor:
+            return None
+
+        if limit == 1:
+            result = self.fetchone(cursor)
+        else:
+            result = self.fetchall(cursor)
+        return result
+
+    def get_count(self, table, condition=None, params=()):
+        """
+        returns th enumber of matching rows in the given table
+        based on a specific contioins
+        """
+        count = self.select(
+            table,
+            columns="COUNT(*)",
+            condition=condition,
+            params=params,
+            limit=1,
+        )
+        return count[0] if count else None
+
+    def close(self):
+        with self.conn_lock:
+            self.conn.close()
+        self.sqlite_flock.delete_lockfile()
+
+    def fetchall(self, cursor):
+        """
+        wrapper for sqlite fetchall to be able to use a lock
+        """
+        with self.conn_lock:
+            res = cursor.fetchall()
+        return res
+
+    def fetchone(self, cursor):
+        """
+        wrapper for sqlite fetchone to be able to use a lock
+        """
+        with self.conn_lock:
+            res = cursor.fetchone()
+        return res
+
+    def log_err(self, query: str, params: tuple, err: str, trial: int):
+        self.print(
+            f"Error executing query: "
+            f"'{query}'. Params: {params}. Error: {err}. "
+            f"Retried executing {trial} times but failed. "
+            f"Query discarded.",
+            0,
+            1,
+        )
+
+    def execute(self, query: str, params=None) -> None:
+        """
+        wrapper for sqlite execute() To avoid
+         'Recursive use of cursors not allowed' error
+         and to be able to use a Lock()
+
+        since sqlite is terrible with multi-process applications
+        this function should be used instead of all calls to commit() and
+        execute()
+
+        using transactions here is a must.
+        Since slips uses python3.10, we can't use autocommit here. we have
+        to do it manually
+        any conn other than the current one will not see the changes this
+        conn did unless they're committed.
+
+        Each call to this function results in 1 sqlite transaction
+        """
+        trial = 0
+        max_trials = 5
+        while trial < max_trials:
+            try:
+                # note that self.conn.in_transaction is not reliable
+                # sqlite may change the state internally, on errors for
+                # example.
+                # if no errors occur, this will be the only transaction in
+                # the conn
+                # self.conn object is still shared across threads, and SQLite
+                # does not allow concurrent use of a single connection without
+                # a lock.
+                with self.conn_lock:
+                    cursor = self.conn.cursor()
+                    if self.conn.in_transaction is False:
+                        cursor.execute("BEGIN")
+
+                    with self._acquire_flock():
+                        if params is None:
+                            cursor.execute(query)
+                        else:
+                            cursor.execute(query, params)
+
+                    # aka END TRANSACTION
+                    if self.conn.in_transaction:
+                        self.conn.commit()
+
+                return cursor
+
+            except sqlite3.Error as err:
+                # no need to manually rollback here
+                # sqlite automatically rolls back the tx if an error occurs
+                err = str(err)
+
+                if "malformed" in err or "closed database" in err:
+                    self.log_err(query, params, err, trial)
+                    self.close()
+                    return
+
+                trial += 1
+                if trial >= max_trials:
+                    self.log_err(query, params, err, trial)
+                    return
+
+                if "database is locked" in err:
+                    sleep(5)
