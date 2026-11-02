@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TRINETRA Console</title>
+<script src="/static/js/theme.js"></script>
+<link rel="stylesheet" href="/static/css/core.css">
+<link rel="stylesheet" href="/static/css/console.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <pattern id="hatch-red" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="6" height="6" fill="#d03b3b" fill-opacity=".06"/><line x1="0" y1="0" x2="0" y2="6" stroke="#d03b3b" stroke-width="1.2" stroke-opacity=".28"/></pattern>
+    <linearGradient id="g-area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2a78d6" stop-opacity=".22"/><stop offset="1" stop-color="#2a78d6" stop-opacity="0"/></linearGradient>
+    <filter id="f-node" x="-20%" y="-30%" width="140%" height="170%"><feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#1c3d6e" flood-opacity=".12"/></filter>
+  </defs>
+</svg>
+
+<aside class="side" id="side">
+  <a class="brand" href="/" title="Home">
+    <span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2.5 4.5 7v8.2c0 7.1 4.9 12.4 11.5 14.3 6.6-1.9 11.5-7.2 11.5-14.3V7z" fill="currentColor"/><path d="M8.6 16c2-3.3 4.5-5 7.4-5s5.4 1.7 7.4 5c-2 3.3-4.5 5-7.4 5s-5.4-1.7-7.4-5z" fill="#fff"/><circle cx="16" cy="16" r="2.6" fill="currentColor"/></svg></span>
+    <div><div class="brand-name">TRINETRA</div><div class="brand-sub">Compromise console</div></div>
+  </a>
+  <nav class="side-nav" role="tablist">
+    <button class="sn active" data-view="overview"><svg class="ic"><use href="/static/img/icons.svg#i-gauge"/></svg><span data-i18n="nav.overview">Overview</span></button>
+    <button class="sn" data-view="matrix"><svg class="ic"><use href="/static/img/icons.svg#i-layers"/></svg><span data-i18n="nav.matrix">Evidence matrix</span></button>
+    <button class="sn" data-view="attack"><svg class="ic"><use href="/static/img/icons.svg#i-crosshair"/></svg><span data-i18n="nav.attack">ATT&amp;CK map</span></button>
+    <button class="sn" data-view="timeline"><svg class="ic"><use href="/static/img/icons.svg#i-route"/></svg><span data-i18n="nav.timeline">Attack timeline</span></button>
+    <button class="sn" data-view="devices"><svg class="ic"><use href="/static/img/icons.svg#i-server"/></svg><span data-i18n="nav.devices">Devices</span></button>
+    <button class="sn" data-view="incidents"><svg class="ic"><use href="/static/img/icons.svg#i-siren"/></svg><span data-i18n="nav.incidents">Incidents</span><span class="badge-n" id="inc-n"></span></button>
+    <div class="sn-sep"></div>
+    <button class="sn" data-view="live"><svg class="ic"><use href="/static/img/icons.svg#i-zap"/></svg><span data-i18n="nav.live">Live attack lab</span><span class="pill-new">LIVE</span></button>
+    <button class="sn" data-view="whatif"><svg class="ic"><use href="/static/img/icons.svg#i-flask-conical"/></svg><span data-i18n="nav.whatif">What-if lab</span></button>
+    <button class="sn" data-view="evaluation"><svg class="ic"><use href="/static/img/icons.svg#i-target"/></svg><span data-i18n="nav.evaluation">Evaluation</span></button>
+  </nav>
+  <div class="side-sec">
+    <div class="side-t" data-i18n="side.export">Export</div>
+    <a class="side-link" href="/report?print=1" target="_blank" rel="noopener"><svg class="ic"><use href="/static/img/icons.svg#i-printer"/></svg><span data-i18n="side.report">Executive report (PDF)</span></a>
+    <a class="side-link" href="/api/export/cef"><svg class="ic"><use href="/static/img/icons.svg#i-download"/></svg><span data-i18n="side.cef">CEF for SIEM</span></a>
+    <a class="side-link" href="/api/export/json"><svg class="ic"><use href="/static/img/icons.svg#i-file-text"/></svg><span data-i18n="side.json">JSON report</span></a>
+    <button class="side-link" id="btn-upload"><svg class="ic"><use href="/static/img/icons.svg#i-database"/></svg><span data-i18n="side.upload">Upload your data</span></button>
+  </div>
+  <div class="side-sec">
+    <div class="side-t" data-i18n="side.learn">Learn</div>
+    <a class="side-link" href="/docs"><svg class="ic"><use href="/static/img/icons.svg#i-book-open"/></svg><span data-i18n="side.docs">Documentation</span></a>
+    <a class="side-link" href="/"><svg class="ic"><use href="/static/img/icons.svg#i-globe"/></svg><span data-i18n="side.home">Project home</span></a>
+  </div>
+  <div class="side-foot">
+    <div class="engine"><svg class="ic"><use href="/static/img/icons.svg#i-cpu"/></svg><div id="engine-meta">–</div></div>
+    <button class="btn sm" id="btn-rerun"><svg class="ic"><use href="/static/img/icons.svg#i-repeat"/></svg><span data-i18n="btn.rerun">Re-run analysis</span></button>
+  </div>
+</aside>
+
+<div class="main">
+  <div class="data-banner" id="data-banner" hidden></div>
+  <header class="bar">
+    <button class="btn icon menu-btn" id="btn-menu" aria-label="Menu"><svg class="ic"><use href="/static/img/icons.svg#i-menu"/></svg></button>
+    <button class="btn primary icon play" id="btn-play" aria-label="Play replay"><svg class="ic" id="play-ic"><use href="/static/img/icons.svg#i-play"/></svg></button>
+    <div class="timeline">
+      <div class="tl-ticks" id="tl-ticks"></div>
+      <input type="range" id="slider" min="0" max="0" value="0" aria-label="Replay time">
+      <div class="tl-days" id="tl-days"></div>
+    </div>
+    <div class="clock"><span class="dim small" data-i18n="bar.time">Analysis time</span><b class="mono" id="clock">–</b></div>
+    <div class="bar-tools">
+      <button class="btn sm story-btn" id="btn-story"><svg class="ic"><use href="/static/img/icons.svg#i-play"/></svg><span data-i18n="btn.story">Story mode</span></button>
+      <button class="btn sm" id="btn-end"><svg class="ic"><use href="/static/img/icons.svg#i-timer"/></svg><span data-i18n="btn.now">Now</span></button>
+      <button class="btn icon sm" id="btn-palette" title="Command palette (Ctrl+K)"><svg class="ic"><use href="/static/img/icons.svg#i-search"/></svg></button>
+      <button class="btn icon sm" id="btn-lang" title="English / हिंदी"><b class="lang-lbl" id="lang-lbl">हि</b></button>
+      <button class="btn icon sm" id="btn-theme" title="Dark / light theme"><svg class="ic"><use id="theme-ic" href="/static/img/icons.svg#i-moon"/></svg></button>
+      <button class="btn icon sm" id="btn-present" title="Presenter mode (P)"><svg class="ic"><use href="/static/img/icons.svg#i-maximize"/></svg></button>
+    </div>
+  </header>
+
+  <main>
+    <!-- OVERVIEW -->
+    <section class="view active" id="view-overview">
+      <div class="status" id="status"></div>
+      <div class="kpis" id="kpis"></div>
+      <div class="panel map-panel">
+        <div class="ph">
+          <div class="ph-l"><span class="ph-ico"><svg class="ic"><use href="/static/img/icons.svg#i-network"/></svg></span><div><h2 data-i18n="map.title">Network map</h2><p data-i18n="map.sub">Hover to trace connections</p></div></div>
+          <div class="ph-r">
+            <div class="seg" id="map-filter" role="tablist" aria-label="Highlight">
+              <button class="active" data-f="all" data-i18n="map.all">All</button><button data-f="COMPROMISED" data-i18n="map.comp">Compromised</button><button data-f="SUSPICIOUS" data-i18n="map.sus">Suspicious</button><button data-f="attack" data-i18n="map.attack">Attack paths</button>
+            </div>
+            <div class="zoom-ctl">
+              <button class="btn icon sm" id="z-in" title="Zoom in"><svg class="ic"><use href="/static/img/icons.svg#i-zoom-in"/></svg></button>
+              <button class="btn icon sm" id="z-out" title="Zoom out"><svg class="ic"><use href="/static/img/icons.svg#i-zoom-out"/></svg></button>
+              <button class="btn icon sm" id="z-fit" title="Fit"><svg class="ic"><use href="/static/img/icons.svg#i-maximize"/></svg></button>
+              <button class="btn icon sm" id="z-reset" title="Reset layout"><svg class="ic"><use href="/static/img/icons.svg#i-repeat"/></svg></button>
+            </div>
+          </div>
+        </div>
+        <div class="map-wrap"><div id="topology" class="topology"></div><div class="minimap" id="minimap"></div></div>
+        <div class="legend" id="map-legend"></div>
+      </div>
+      <div class="grid-main">
+        <div class="panel">
+          <div class="ph"><div class="ph-l"><span class="ph-ico red"><svg class="ic"><use href="/static/img/icons.svg#i-siren"/></svg></span><div><h2 data-i18n="inc.title">Open incidents</h2><p data-i18n="inc.sub">Linked</p></div></div></div>
+          <div id="incident-summary" class="inc-grid"></div>
+        </div>
+        <div class="panel feed-panel">
+          <div class="ph"><div class="ph-l"><span class="ph-ico"><svg class="ic"><use href="/static/img/icons.svg#i-bell-ring"/></svg></span><div><h2 data-i18n="feed.title">Verdict feed</h2><p id="feed-count"></p></div></div></div>
+          <ol class="feed" id="feed"></ol>
+        </div>
+      </div>
+    </section>
+
+    <!-- MATRIX -->
+    <section class="view" id="view-matrix">
+      <div class="panel">
+        <div class="ph">
+          <div class="ph-l"><span class="ph-ico"><svg class="ic"><use href="/static/img/icons.svg#i-layers"/></svg></span><div><h2 data-i18n="matrix.title">Evidence matrix</h2><p data-i18n="matrix.sub">Every device</p></div></div>
+          <div class="ramp"><span class="small dim">fused evidence (−log₁₀ p)</span><span class="ramp-bar"></span><span class="mono small">0</span><span class="mono small">8+</span></div>
+        </div>
+        <div class="matrix-wrap"><canvas id="matrix"></canvas></div>
+        <div class="legend"><span class="lg"><i class="sw-bad"></i>window after the device was convicted</span><span class="lg"><i class="sw-warn"></i>alarm active</span><span class="small dim">Hover for exact values · click a row to open the device</span></div>
+      </div>
+    </section>
+
+    <!-- ATT&CK -->
+    <section class="view" id="view-attack"><div id="attack-view"></div></section>
+    <!-- TIMELINE -->
+    <section class="view" id="view-timeline"><div id="timeline-view"></div></section>
+    <!-- LIVE -->
+    <section class="view" id="view-live"><div id="live-view"></div></section>
+    <!-- WHAT-IF -->
+    <section class="view" id="view-whatif"><div id="whatif-view"></div></section>
+
+    <!-- DEVICES -->
+    <section class="view" id="view-devices">
+      <div class="panel">
+        <div class="filters">
+          <label class="search"><svg class="ic"><use href="/static/img/icons.svg#i-search"/></svg><input type="search" id="f-search" placeholder="Search device or IP…"></label>
+          <select id="f-type"><option value="">All device classes</option><option value="host">Systems</option><option value="firewall">Firewalls</option><option value="router">Routers</option><option value="network">Network sensors</option></select>
+          <select id="f-verdict"><option value="">All verdicts</option><option>COMPROMISED</option><option>SUSPICIOUS</option><option>CLEAN</option></select>
+        </div>
+        <table class="table" id="device-table">
+          <thead><tr><th>Device</th><th>Class</th><th>Address</th><th>Verdict</th><th>Evidence trend</th><th class="num">Peak</th><th>Attack stages</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="view" id="view-incidents"><div id="incidents"></div></section>
+    <section class="view" id="view-evaluation"><div id="evaluation"></div></section>
+  </main>
+</div>
+
+<aside class="drawer" id="drawer" aria-hidden="true"><div class="drawer-inner" id="drawer-body"></div></aside>
+<div class="scrim" id="scrim"></div>
+
+<!-- story caption -->
+<div class="story" id="story" hidden>
+  <div class="story-top"><span class="story-step mono" id="story-step"></span><span class="story-time mono" id="story-time"></span>
+    <button class="btn icon sm" id="story-x" aria-label="Exit story"><svg class="ic"><use href="/static/img/icons.svg#i-x"/></svg></button></div>
+  <h3 id="story-title"></h3>
+  <p id="story-text"></p>
+  <div class="story-bar"><div id="story-prog"></div></div>
+  <div class="story-btns">
+    <button class="btn sm" id="story-prev"><span data-i18n="story.prev">Back</span></button>
+    <button class="btn sm" id="story-open"><svg class="ic"><use href="/static/img/icons.svg#i-file-search"/></svg><span data-i18n="story.open">Open report</span></button>
+    <button class="btn sm" id="story-auto"><svg class="ic"><use id="story-auto-ic" href="/static/img/icons.svg#i-play"/></svg><span data-i18n="story.auto">Auto-play</span></button>
+    <button class="btn primary sm" id="story-next"><span data-i18n="story.next">Next</span><svg class="ic"><use href="/static/img/icons.svg#i-arrow-right"/></svg></button>
+  </div>
+</div>
+
+<!-- command palette -->
+<div class="modal" id="palette" hidden>
+  <div class="modal-box palette-box">
+    <label class="pal-in"><svg class="ic"><use href="/static/img/icons.svg#i-search"/></svg><input id="pal-q" data-i18n-ph="palette.ph" placeholder="Type a command or a device name…" autocomplete="off"><span class="kbd">Esc</span></label>
+    <ul class="pal-list" id="pal-list"></ul>
+    <div class="pal-foot"><span><span class="kbd">↑</span><span class="kbd">↓</span> move</span><span><span class="kbd">Enter</span> open</span><span><span class="kbd">Ctrl</span>+<span class="kbd">K</span> anywhere</span></div>
+  </div>
+</div>
+
+<!-- upload -->
+<div class="modal" id="upload" hidden>
+  <div class="modal-box upload-box">
+    <div class="ph"><div class="ph-l"><span class="ph-ico"><svg class="ic"><use href="/static/img/icons.svg#i-database"/></svg></span><div><h2>Analyse your own telemetry</h2><p>UBT .jsonl + inventory.json, Zeek conn/dns logs, Slips alerts.json, router/firewall syslog or config backups</p></div></div>
+      <button class="btn icon sm" id="up-x" aria-label="Close"><svg class="ic"><use href="/static/img/icons.svg#i-x"/></svg></button></div>
+    <label class="drop" id="drop"><input type="file" id="up-files" multiple hidden>
+      <span class="drop-ico"><svg class="ic"><use href="/static/img/icons.svg#i-database"/></svg></span>
+      <b>Drop files here or click to choose</b><span class="dim small">Files stay on this machine; analysis runs locally.</span></label>
+    <ul class="up-list" id="up-list"></ul>
+    <div class="up-opts"><label>Learn the baseline from the first <b id="frac-v">60%</b> of the time span <input type="range" id="up-frac" min="30" max="90" value="60" step="5"></label></div>
+    <div class="up-foot"><a class="btn sm" href="/api/sample"><svg class="ic"><use href="/static/img/icons.svg#i-download"/></svg>Download a sample dataset</a>
+      <button class="btn primary" id="up-go" disabled><svg class="ic"><use href="/static/img/icons.svg#i-radar"/></svg>Analyse</button></div>
+    <div class="up-err" id="up-err" hidden></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<div class="overlay" id="overlay">
+  <div class="overlay-box">
+    <span class="ov-ico"><svg class="ic"><use href="/static/img/icons.svg#i-radar"/></svg></span>
+    <div class="overlay-title">Analysing the network <b id="progress-pct">0%</b></div>
+    <div class="progress"><div id="progress-bar"></div></div>
+    <div class="overlay-msg" id="progress-msg">starting…</div>
+  </div>
+</div>
+<div class="tooltip" id="tooltip" role="status"></div>
+<script src="/static/js/i18n.js"></script>
+<script src="/static/js/explain.js"></script>
+<script src="/static/js/console.js"></script>
+<script src="/static/js/extras.js"></script>
+</body>
+</html>
