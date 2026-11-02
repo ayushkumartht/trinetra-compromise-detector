@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TRINETRA · Compromise assessment report</title>
+<link rel="stylesheet" href="/static/css/core.css">
+<style>
+  body { background: #eef1f5; }
+  .tools { position: sticky; top: 0; z-index: 5; display: flex; gap: 8px; justify-content: center; padding: 12px; background: rgba(238, 241, 245, .9); backdrop-filter: blur(8px); }
+  .page { width: 210mm; min-height: 297mm; margin: 18px auto; background: #fff; color: #0b0b0b; padding: 18mm 16mm; box-shadow: 0 20px 50px -20px rgba(16, 36, 64, .35); border-radius: 6px; }
+  .cover { display: flex; flex-direction: column; justify-content: space-between; min-height: 261mm; }
+  .c-top { display: flex; justify-content: space-between; align-items: center; }
+  .c-title { margin-top: 40mm; }
+  .c-title .k { font-size: 12px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: #2a78d6; }
+  .c-title h1 { font-size: 40px; line-height: 1.05; letter-spacing: -.03em; margin: 10px 0 14px; }
+  .c-title p { color: #52514e; font-size: 15px; max-width: 140mm; }
+  .verdict { display: flex; gap: 16px; align-items: center; padding: 18px 20px; border-radius: 16px; margin-top: 14mm; }
+  .verdict.bad { background: #fdecec; color: #a32020; }
+  .verdict.warn { background: #fff4d6; color: #7a5300; }
+  .verdict.good { background: #e5f6e5; color: #066d06; }
+  .verdict .ic { width: 34px; height: 34px; }
+  .verdict b { font-size: 20px; display: block; }
+  .c-meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; font-size: 12px; color: #52514e; border-top: 1px solid #e6e6e6; padding-top: 12px; }
+  .c-meta b { display: block; color: #0b0b0b; font-size: 13.5px; }
+  h2 { font-size: 20px; letter-spacing: -.02em; margin: 0 0 10px; display: flex; align-items: center; gap: 10px; }
+  h2 .n { width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; background: #eef4fc; color: #1c5cab; font-size: 13px; }
+  h3 { font-size: 15px; margin: 18px 0 8px; }
+  p, li { font-size: 13px; line-height: 1.6; color: #2c2b29; }
+  section { margin-bottom: 12mm; break-inside: avoid-page; }
+  .kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin: 12px 0; }
+  .kpi { border: 1px solid #e6e6e6; border-radius: 12px; padding: 10px 12px; }
+  .kpi b { font-size: 24px; display: block; letter-spacing: -.03em; }
+  .kpi span { font-size: 11px; color: #898781; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; font-size: 11px; color: #52514e; background: #f6f7f9; padding: 7px 8px; border-bottom: 1px solid #e1e0d9; }
+  td { padding: 7px 8px; border-bottom: 1px solid #eeeeee; vertical-align: top; }
+  .stages { display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; margin: 8px 0; }
+  .stage { font-size: 9.5px; text-align: center; padding: 6px 2px; border-radius: 6px; background: #f3f4f6; color: #898781; border: 1px dashed #dcdcdc; }
+  .stage.hit { background: #fdecec; color: #a32020; border: 1px solid #f3c4c4; font-weight: 700; }
+  .inc { border: 1px solid #e6e6e6; border-radius: 14px; padding: 12px 14px; margin-bottom: 10px; break-inside: avoid; }
+  .dev { border: 1px solid #e6e6e6; border-radius: 14px; padding: 12px 14px; margin-bottom: 10px; break-inside: avoid; }
+  .dev-h { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .dev-h b { font: 700 15px var(--mono); }
+  .mono { font-family: var(--mono); }
+  .muted { color: #898781; }
+  .v { height: 22px; font-size: 11px; }
+  ol.acts { margin: 6px 0 0; padding-left: 18px; }
+  .foot { font-size: 10.5px; color: #898781; border-top: 1px solid #e6e6e6; padding-top: 8px; margin-top: 10mm; }
+  @page { size: A4; margin: 0; }
+  @media print {
+    body { background: #fff; }
+    .tools { display: none; }
+    .page { margin: 0; box-shadow: none; border-radius: 0; width: auto; min-height: auto; page-break-after: always; }
+  }
+</style>
+</head>
+<body>
+<div class="tools">
+  <button class="btn primary" onclick="window.print()"><svg class="ic"><use href="/static/img/icons.svg#i-printer"/></svg>Print / Save as PDF</button>
+  <button class="btn" id="lang"><svg class="ic"><use href="/static/img/icons.svg#i-globe"/></svg><span id="lang-t">हिंदी</span></button>
+  <a class="btn" href="/console"><svg class="ic"><use href="/static/img/icons.svg#i-monitor"/></svg>Back to console</a>
+</div>
+<div id="report"><div class="page"><p class="muted">Loading report…</p></div></div>
+<script src="/static/js/explain.js"></script>
+<script src="/static/js/report.js"></script>
+</body>
+</html>
