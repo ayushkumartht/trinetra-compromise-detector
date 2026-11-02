@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TRINETRA Documentation</title>
+<script src="/static/js/theme.js"></script>
+<link rel="stylesheet" href="/static/css/core.css">
+<link rel="stylesheet" href="/static/css/docs.css">
+</head>
+<body>
+<header class="dnav">
+  <a class="brand" href="/">
+    <span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2.5 4.5 7v8.2c0 7.1 4.9 12.4 11.5 14.3 6.6-1.9 11.5-7.2 11.5-14.3V7z" fill="currentColor"/><path d="M8.6 16c2-3.3 4.5-5 7.4-5s5.4 1.7 7.4 5c-2 3.3-4.5 5-7.4 5s-5.4-1.7-7.4-5z" fill="#fff"/><circle cx="16" cy="16" r="2.6" fill="currentColor"/></svg></span>
+    <div><div class="brand-name">TRINETRA</div><div class="brand-sub">Documentation</div></div>
+  </a>
+  <div class="dnav-r">
+    <a href="/" class="dl"><svg class="ic"><use href="/static/img/icons.svg#i-globe"/></svg>Home</a>
+    <a href="/docs#/18-research-survey" class="dl"><svg class="ic"><use href="/static/img/icons.svg#i-library"/></svg>Research</a>
+    <a class="btn primary" href="/console"><svg class="ic"><use href="/static/img/icons.svg#i-monitor"/></svg>Open console</a>
+  </div>
+</header>
+<div class="layout">
+  <aside class="dside">
+    <label class="dsearch"><svg class="ic"><use href="/static/img/icons.svg#i-search"/></svg><input type="search" id="q" placeholder="Search docs…" aria-label="Search documentation"></label>
+    <nav id="toc-nav"></nav>
+  </aside>
+  <main class="doc">
+    <article id="doc" class="md"><div class="loading">Loading…</div></article>
+    <nav class="pager" id="pager"></nav>
+  </main>
+  <aside class="onpage"><div class="onpage-t"><svg class="ic"><use href="/static/img/icons.svg#i-list-checks"/></svg>On this page</div><nav id="onpage"></nav></aside>
+</div>
+<script src="/static/vendor/marked.umd.js"></script>
+<script src="/static/vendor/mermaid.min.js"></script>
+<script src="/static/js/docs.js"></script>
+</body>
+</html>
