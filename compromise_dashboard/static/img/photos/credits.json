@@ -1,0 +1,92 @@
+[
+ {
+  "file": "datacenter.jpg",
+  "label": "Data-centre aisle",
+  "title": "Datacenter Server Racks (22370909788).jpg",
+  "artist": "Carl Lender from Sunrise, USA",
+  "license": "CC BY 2.0",
+  "source": "https://commons.wikimedia.org/wiki/File:Datacenter_Server_Racks_(22370909788).jpg",
+  "w": 1400,
+  "h": 933
+ },
+ {
+  "file": "rack.jpg",
+  "label": "Server rack",
+  "title": "Rear of rack at NERSC data center - closeup.jpg",
+  "artist": "Derrick Coetzee from Berkeley, CA, USA",
+  "license": "CC0",
+  "source": "https://commons.wikimedia.org/wiki/File:Rear_of_rack_at_NERSC_data_center_-_closeup.jpg",
+  "w": 930,
+  "h": 1400
+ },
+ {
+  "file": "switches.jpg",
+  "label": "Rack-mount switches",
+  "title": "19-inch rackmount Ethernet switches and patch panels.jpg",
+  "artist": "Dsimic",
+  "license": "CC BY-SA 4.0",
+  "source": "https://commons.wikimedia.org/wiki/File:19-inch_rackmount_Ethernet_switches_and_patch_panels.jpg",
+  "w": 1280,
+  "h": 960
+ },
+ {
+  "file": "firewall.jpg",
+  "label": "Juniper SRX firewall",
+  "title": "Juniper srx210 front view.jpg",
+  "artist": "MarcPG",
+  "license": "CC BY-SA 3.0",
+  "source": "https://commons.wikimedia.org/wiki/File:Juniper_srx210_front_view.jpg",
+  "w": 1400,
+  "h": 338
+ },
+ {
+  "file": "router.jpg",
+  "label": "MikroTik router",
+  "title": "MikroTik hAP ac2.jpg",
+  "artist": "Uhernandez",
+  "license": "CC BY 3.0",
+  "source": "https://commons.wikimedia.org/wiki/File:MikroTik_hAP_ac2.jpg",
+  "w": 1400,
+  "h": 788
+ },
+ {
+  "file": "ports.jpg",
+  "label": "Switch ports",
+  "title": "RJ45 Switch Ports.jpg",
+  "artist": "Ben Franske",
+  "license": "CC BY-SA 4.0",
+  "source": "https://commons.wikimedia.org/wiki/File:RJ45_Switch_Ports.jpg",
+  "w": 1400,
+  "h": 933
+ },
+ {
+  "file": "soc.jpg",
+  "label": "Network operations centre",
+  "title": "Batelco Network Operations Centre (NOC).JPG",
+  "artist": "Masdestructive",
+  "license": "CC BY-SA 3.0",
+  "source": "https://commons.wikimedia.org/wiki/File:Batelco_Network_Operations_Centre_(NOC).JPG",
+  "w": 1400,
+  "h": 933
+ },
+ {
+  "file": "fiber.jpg",
+  "label": "Fibre backbone",
+  "title": "Fujikura optic fiber at Science Museum.jpg",
+  "artist": "Syced",
+  "license": "CC0",
+  "source": "https://commons.wikimedia.org/wiki/File:Fujikura_optic_fiber_at_Science_Museum.jpg",
+  "w": 1400,
+  "h": 1050
+ },
+ {
+  "file": "cables.jpg",
+  "label": "Wiring closet",
+  "title": "Cable closet bh.jpg",
+  "artist": "",
+  "license": "Public domain",
+  "source": "https://commons.wikimedia.org/wiki/File:Cable_closet_bh.jpg",
+  "w": 1400,
+  "h": 1039
+ }
+]
