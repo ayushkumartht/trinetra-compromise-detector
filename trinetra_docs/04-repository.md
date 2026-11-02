@@ -35,11 +35,12 @@ slips/
 │       └── vendor/  marked.umd.js · mermaid.min.js (offline docs rendering)
 ├── tests/unit/modules/compromise_detector/ ← NEW · engine unit tests
 ├── trinetra_docs/                          ← NEW · this documentation (Markdown + Mermaid)
-├── TRINETRA.md                             ← NEW · project README
+├── README.md                               ← NEW · project README (TRINETRA)
+├── SLIPS_README.md                         ← the original Slips README, renamed
 └── run_trinetra.bat                        ← NEW · Windows launcher
 ```
 
-Nothing else in the Slips tree was touched; `git status` shows exactly these paths.
+Apart from renaming Slips' README to `SLIPS_README.md`, nothing else in the Slips tree was touched. The first commit of the repository is the unmodified Slips v1.1.24 tree, so `git diff <first commit> HEAD --stat` lists exactly these paths.
 
 ## How the files depend on each other
 

@@ -633,7 +633,7 @@ digital forsenics/
     │   ├── data/results.json            ← analysis ka saved result
     │   └── static/                      ← landing / console / docs ke HTML, CSS, JS
     ├── trinetra_docs/                   ← documentation (ye file bhi yahin hai)
-    ├── TRINETRA.md                      ← project ka README
+    ├── README.md                        ← project ka README (Slips wala ab SLIPS_README.md hai)
     └── run_trinetra.bat                 ← Windows pe double-click se chalao
 ```
 

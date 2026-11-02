@@ -38,7 +38,7 @@ python -m compromise_dashboard        # http://127.0.0.1:5050
 
 ## 2 · Slips with the TRINETRA module (Linux / Docker)
 
-Follow Slips' own installation (`docker/` or `install/` in this repository; see `README.md` and `docs/` of Slips). The module is auto-discovered. Then:
+Follow Slips' own installation (`docker/` or `install/` in this repository; see `SLIPS_README.md` and `docs/` of Slips). The module is auto-discovered. Then:
 
 ```bash
 ./slips.py -i eth0                       # live, or: -f capture.pcap
