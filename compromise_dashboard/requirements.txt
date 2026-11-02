@@ -1,0 +1,5 @@
+# TRINETRA engine + dashboard. Slips itself has its own list in install/requirements.txt.
+flask>=3.0
+numpy>=1.26
+scipy>=1.11
+scikit-learn>=1.4
