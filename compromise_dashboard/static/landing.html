@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TRINETRA · See the breach before anyone names it</title>
+<meta name="description" content="AI/ML compromise detection for systems, firewalls, routers and networks, without Indicators of Compromise. Built on Stratosphere Slips.">
+<link rel="stylesheet" href="/static/css/landing.css">
+</head>
+<body>
+<div class="progress" id="progress" aria-hidden="true"></div>
+
+<!-- ============================== NAV ============================== -->
+<header class="nav" id="nav">
+  <a class="brand" href="/" aria-label="TRINETRA home">
+    <span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2.5 4.5 7v8.2c0 7.1 4.9 12.4 11.5 14.3 6.6-1.9 11.5-7.2 11.5-14.3V7z" fill="currentColor"/><path d="M8.6 16c2-3.3 4.5-5 7.4-5s5.4 1.7 7.4 5c-2 3.3-4.5 5-7.4 5s-5.4-1.7-7.4-5z" fill="#fff"/><circle cx="16" cy="16" r="2.6" fill="currentColor"/></svg></span>
+    <span class="brand-name">TRINETRA</span>
+  </a>
+  <nav class="nav-links" aria-label="Sections">
+    <a href="#field">Devices</a><a href="#how">How it works</a><a href="#evidence">Real logs</a>
+    <a href="#product">Console</a><a href="#results">Results</a><a href="#research">Research</a><a href="/docs">Docs</a>
+  </nav>
+  <a class="btn btn-dark btn-sm" href="/console"><svg class="ic"><use href="/static/img/icons.svg#i-monitor"/></svg>Open console</a>
+</header>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero" id="hero">
+  <div class="blob b1"></div><div class="blob b2"></div><div class="dots"></div><div class="hero-glow" aria-hidden="true"></div>
+  <div class="hero-copy">
+    <span class="pill reveal"><svg class="ic"><use href="/static/img/icons.svg#i-sparkles"/></svg>AI/ML · Digital forensics · No IoCs required</span>
+    <h1 class="reveal">See the breach<br><span class="grad">before anyone names it.</span></h1>
+    <p class="lede reveal">TRINETRA tells you whether a <span class="rotor" id="rotor" aria-live="polite"><b>router</b></span> is already compromised, from behaviour alone, before a single hash, IP or YARA rule exists for the attack.</p>
+    <div class="cta reveal">
+      <a class="btn btn-primary" href="/console">Launch the live console<svg class="ic"><use href="/static/img/icons.svg#i-arrow-right"/></svg></a>
+      <a class="btn btn-ghost" href="/docs"><svg class="ic"><use href="/static/img/icons.svg#i-book-open"/></svg>Read the docs</a>
+    </div>
+    <ul class="hero-stats reveal" id="hero-stats">
+      <li><b><span data-count="7" data-k="tp">7</span><small>/<i data-k="n_attacked">7</i></small></b><span>attacked devices caught</span></li>
+      <li><b><span data-count="0" data-k="fp">0</span></b><span>false compromises</span></li>
+      <li><b><span data-count="30" data-k="ttd">30</span><small>min</small></b><span>median time to detect</span></li>
+    </ul>
+  </div>
+
+  <div class="hero-art reveal">
+    <figure class="hv-frame">
+      <img src="/static/img/photos/router.jpg" alt="Edge router under analysis (real photograph)">
+      <div class="hv-grid" aria-hidden="true"></div>
+      <div class="hv-scan" aria-hidden="true"></div>
+      <span class="hv-tag"><svg class="ic"><use href="/static/img/icons.svg#i-router"/></svg>RTR-EDGE · 10.0.0.2</span>
+      <span class="hv-hot" aria-hidden="true"><i></i></span>
+      <div class="hv-card hv-verdict">
+        <div class="f-head"><span class="f-ico red"><svg class="ic"><use href="/static/img/icons.svg#i-siren"/></svg></span><div><b>Verdict</b><small>Mon 23:30 · 4 ATT&amp;CK stages</small></div></div>
+        <span class="status s-bad"><svg class="ic"><use href="/static/img/icons.svg#i-shield-alert"/></svg>Compromised</span>
+        <div class="f-tags"><span>Persistence</span><span>Defense Evasion</span><span>C2</span><span>Exfiltration</span></div>
+      </div>
+      <div class="hv-card hv-evid">
+        <div class="f-head"><span class="f-ico blue"><svg class="ic"><use href="/static/img/icons.svg#i-chart-line"/></svg></span><div><b>Fused evidence</b><small>−log₁₀ p · last 24 h</small></div></div>
+        <svg class="spark" viewBox="0 0 160 44" aria-hidden="true"><path class="spark-area" d="M0 40 L14 38 L28 39 L42 36 L56 38 L70 37 L84 39 L98 35 L112 9 L126 14 L140 12 L160 13 L160 44 L0 44Z"/><path class="spark-line" d="M0 40 L14 38 L28 39 L42 36 L56 38 L70 37 L84 39 L98 35 L112 9 L126 14 L140 12 L160 13"/><line x1="0" x2="160" y1="29" y2="29" class="spark-ref"/></svg>
+      </div>
+    </figure>
+  </div>
+
+  <a class="ticker" href="#evidence" aria-label="Real log lines from public malware captures, scroll to the real-logs section">
+    <span class="tk-live"><i></i>Real captures</span>
+    <span class="tk-view"><span class="tk-track" id="tk-track"></span></span>
+  </a>
+</section>
+
+<!-- ============================== PLATFORMS ============================== -->
+<section class="logos" aria-label="Platforms and tools">
+  <p class="logos-title">Runs on any Linux, Windows or Docker host · built with open, auditable tools · SIEM-ready</p>
+  <div class="marquee"><div class="track" id="logo-track"></div></div>
+</section>
+
+<!-- ============================== FIELD (photos) ============================== -->
+<section class="sec" id="field">
+  <div class="sec-head reveal">
+    <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-server"/></svg>Where attackers hide</span>
+    <h2 class="split-words">Real hardware.<br>Real blind spots.</h2>
+    <p>Routers, firewalls, switches and servers run the business, and most of them can't run an endpoint agent. Hover a device to see what TRINETRA watches on it.</p>
+  </div>
+  <div class="bento" id="bento"></div>
+  <p class="photo-note reveal"><svg class="ic"><use href="/static/img/icons.svg#i-badge-check"/></svg>Real photographs from Wikimedia Commons (CC0 / CC BY / CC BY-SA), no AI images. Credits at the <a href="#credits">bottom of the page</a>.</p>
+</section>
+
+<!-- ============================== PROBLEM ============================== -->
+<section class="sec" id="problem">
+  <div class="sec-head reveal">
+    <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-triangle-alert"/></svg>The problem</span>
+    <h2>Attackers changed.<br>Signatures didn't.</h2>
+    <p>Indicators of Compromise (hashes, IPs, domains) only describe attacks someone has already analysed. Modern intrusions arrive before any IoC exists.</p>
+  </div>
+  <div class="cards3">
+    <article class="card reveal"><span class="ico-badge"><svg class="ic"><use href="/static/img/icons.svg#i-hourglass"/></svg></span>
+      <h3>IoCs arrive weeks late</h3><p>An indicator is published only after an incident has been analysed. Until then, signature tools see nothing.</p></article>
+    <article class="card reveal"><span class="ico-badge"><svg class="ic"><use href="/static/img/icons.svg#i-ghost"/></svg></span>
+      <h3>Living off the land</h3><p>Attackers use built-in tools and stolen credentials. There is no malicious file to match at all.</p></article>
+    <article class="card reveal"><span class="ico-badge"><svg class="ic"><use href="/static/img/icons.svg#i-router"/></svg></span>
+      <h3>Edge devices are blind spots</h3><p>Routers, firewalls and VPNs can't run endpoint agents, yet they are today's favourite target.</p></article>
+  </div>
+  <div class="timeline reveal" aria-label="Real edge-device compromises">
+    <div class="tl-line"></div>
+    <div class="tl-items" id="timeline"></div>
+  </div>
+</section>
+
+<!-- ============================== HOW ============================== -->
+<section class="sec alt" id="how">
+  <div class="sec-head reveal">
+    <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-workflow"/></svg>How it works</span>
+    <h2>From raw telemetry to a<br>verdict you can defend.</h2>
+    <p>One engine for every device class. Every number is calibrated, every verdict is explained.</p>
+  </div>
+  <ol class="steps" id="steps">
+    <li class="step reveal"><span class="step-ico"><svg class="ic"><use href="/static/img/icons.svg#i-database"/></svg></span><span class="step-n">01</span>
+      <h3>Collect</h3><p>Slips/Zeek flows and DNS, router &amp; firewall syslog and configs, host logins and processes.</p></li>
+    <li class="step reveal"><span class="step-ico"><svg class="ic"><use href="/static/img/icons.svg#i-binary"/></svg></span><span class="step-n">02</span>
+      <h3>Normalise</h3><p>Everything becomes one event language (UBT), so one engine covers four device classes.</p></li>
+    <li class="step reveal"><span class="step-ico"><svg class="ic"><use href="/static/img/icons.svg#i-activity"/></svg></span><span class="step-n">03</span>
+      <h3>Learn normal</h3><p>28 behaviours per device every 15 minutes, compared with its own past and its peers.</p></li>
+    <li class="step reveal"><span class="step-ico"><svg class="ic"><use href="/static/img/icons.svg#i-brain-circuit"/></svg></span><span class="step-n">04</span>
+      <h3>Detect &amp; fuse</h3><p>8 detectors → calibrated p-values → Cauchy fusion → CUSUM persistence.</p></li>
+    <li class="step reveal"><span class="step-ico"><svg class="ic"><use href="/static/img/icons.svg#i-shield-check"/></svg></span><span class="step-n">05</span>
+      <h3>Verdict</h3><p>Compromised only with ≥ 2 independent ATT&amp;CK stages. Forensic report included.</p></li>
+  </ol>
+
+  <div class="coverage" id="coverage">
+    <article class="dev reveal"><span class="dev-ico"><svg class="ic"><use href="/static/img/icons.svg#i-laptop"/></svg></span><h3>Systems</h3>
+      <ul><li>never-seen process chains</li><li>new user@source logins</li><li>beacons &amp; DNS tunnelling</li></ul></article>
+    <article class="dev reveal"><span class="dev-ico"><svg class="ic"><use href="/static/img/icons.svg#i-brick-wall"/></svg></span><h3>Firewalls</h3>
+      <ul><li>any → internal rules</li><li>rogue admins, exposed management</li><li>firewall-originated C2</li></ul></article>
+    <article class="dev reveal"><span class="dev-ico"><svg class="ic"><use href="/static/img/icons.svg#i-router"/></svg></span><h3>Routers</h3>
+      <ul><li>tunnels &amp; traffic mirroring</li><li>logging removed</li><li>unusual syslog grammar</li></ul></article>
+    <article class="dev reveal"><span class="dev-ico"><svg class="ic"><use href="/static/img/icons.svg#i-network"/></svg></span><h3>Networks</h3>
+      <ul><li>rare internal edges</li><li>scans &amp; fan-out</li><li>exfiltration volume</li></ul></article>
+  </div>
+</section>
+
+<!-- ============================== REAL LOGS ============================== -->
+<section class="sec" id="evidence">
+  <div class="sec-head reveal">
+    <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-scroll-text"/></svg>Real logs, not synthetic</span>
+    <h2 class="split-words">Real attacks, captured<br>on real networks.</h2>
+    <p>Every line below is copied verbatim from public captures by the Stratosphere Laboratory (CTU Prague) that ship with Slips. Pick a capture and watch what TRINETRA's own feature code measures on it.</p>
+  </div>
+  <div class="ev-tabs reveal" id="ev-tabs" role="tablist" aria-label="Real captures"></div>
+  <div class="ev-wrap reveal">
+    <div class="logwin">
+      <div class="lw-bar">
+        <span class="dots3" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="lw-title" id="lw-title">conn.log</span>
+        <span class="lw-ctrl">
+          <span class="lw-count" id="lw-count"></span>
+          <button id="lw-pause" aria-label="Pause stream"><svg class="ic"><use href="/static/img/icons.svg#i-pause"/></svg></button>
+          <button id="lw-replay" aria-label="Replay stream"><svg class="ic"><use href="/static/img/icons.svg#i-repeat"/></svg></button>
+        </span>
+      </div>
+      <div class="lw-body" id="lw-body"></div>
+      <div class="lw-foot"><svg class="ic"><use href="/static/img/icons.svg#i-database"/></svg><span id="lw-src"></span><span class="lw-hint">click a line for the raw record</span></div>
+    </div>
+    <aside class="ev-side">
+      <div class="ev-card"><h4><svg class="ic"><use href="/static/img/icons.svg#i-file-search"/></svg>What the capture shows</h4><dl class="sig" id="ev-signals"></dl></div>
+      <div class="ev-card" id="ev-pulse-card"><h4><svg class="ic"><use href="/static/img/icons.svg#i-activity"/></svg>Contact rhythm <small>first 80 real timestamps</small></h4><canvas id="ev-pulse" height="70"></canvas></div>
+      <div class="ev-card" id="ev-feat-card"><h4><svg class="ic"><use href="/static/img/icons.svg#i-cpu"/></svg>TRINETRA features <small id="ev-feat-sub"></small></h4><div class="feats" id="ev-feats"></div></div>
+      <div class="ev-card ev-note"><svg class="ic"><use href="/static/img/icons.svg#i-brain-circuit"/></svg><p id="ev-note"></p></div>
+    </aside>
+  </div>
+</section>
+
+<!-- ============================== DETECTORS ============================== -->
+<section class="sec" id="detectors">
+  <div class="sec-head reveal">
+    <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-scan-eye"/></svg>Eight independent detectors</span>
+    <h2>Eight ways of noticing<br>that something is off.</h2>
+    <p>Each detector sees one facet of a compromise. Alone, each has blind spots; fused, they catch all seven attacked devices in the benchmark.</p>
+  </div>
+  <div class="det-grid" id="det-grid"></div>
+</section>
+
+<!-- ============================== FALSE ALARMS ============================== -->
+<section class="sec alt" id="false-alarms">
+  <div class="split">
+    <div class="reveal">
+      <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-filter"/></svg>Minimising false alarms</span>
+      <h2>Eight layers between<br>noise and a verdict.</h2>
+      <ol class="layers">
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-clock"/></svg><div><b>Own baseline + time of day</b><span>A 2 a.m. backup is normal for that server.</span></div></li>
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-gauge"/></svg><div><b>Calibrated p-values</b><span>Thresholds mean a known false-alarm probability.</span></div></li>
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-git-compare"/></svg><div><b>Cauchy fusion</b><span>One noisy detector cannot convict alone.</span></div></li>
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-repeat"/></svg><div><b>CUSUM persistence</b><span>Blips fade; low-and-slow attacks accumulate.</span></div></li>
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-layers"/></svg><div><b>Fleet consensus</b><span>Change on many peers at once is IT, not intrusion.</span></div></li>
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-key-round"/></svg><div><b>Change-window context</b><span>Known admin + maintenance window = planned.</span></div></li>
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-list-checks"/></svg><div><b>Kill-chain corroboration</b><span>"Compromised" needs ≥ 2 attack stages.</span></div></li>
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-lock"/></svg><div><b>Gated learning + feedback</b><span>No baseline poisoning; analysts can mark benign.</span></div></li>
+      </ol>
+    </div>
+    <div class="proof card reveal">
+      <div class="proof-head"><span class="ico-badge sm"><svg class="ic"><use href="/static/img/icons.svg#i-chart-line"/></svg></span>
+        <div><h3>Ablation: remove one layer, watch the noise</h3><small>Same week of data and baseline. Clean devices that raised any alarm.</small></div></div>
+      <div class="bars" id="bars"></div>
+      <div class="bars-note"><svg class="ic"><use href="/static/img/icons.svg#i-badge-check"/></svg><span id="bars-note">Full system: 0 clean devices wrongly convicted.</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== RESULTS ============================== -->
+<section class="sec" id="results">
+  <div class="sec-head reveal">
+    <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-target"/></svg>Benchmark results</span>
+    <h2>Four IoC-free attacks. Six benign traps.</h2>
+    <p>A 22-device enterprise, 4 days of baseline and 3 days of test, with 414,080 events. Every attacker IP and domain was new and random.</p>
+  </div>
+  <div class="numbers reveal">
+    <div><b data-count="100" data-k="precision">100</b><i>%</i><span>precision</span></div>
+    <div><b data-count="100" data-k="recall">100</b><i>%</i><span>recall</span></div>
+    <div><b data-count="0" data-k="fp2">0</b><i>/15</i><span>clean devices convicted</span></div>
+    <div><b data-count="30" data-k="ttd2">30</b><i>min</i><span>median time to detect</span></div>
+  </div>
+  <div class="scen-grid" id="scenarios"></div>
+  <p class="fine reveal"><svg class="ic"><use href="/static/img/icons.svg#i-flask-conical"/></svg>Benchmark data is simulated: no public dataset combines router/firewall configs, syslog, host telemetry and flows with ground truth. Public-dataset and lab validation are on the roadmap.</p>
+</section>
+
+<!-- ============================== PRODUCT ============================== -->
+<section class="sec alt" id="product">
+  <div class="sec-head reveal">
+    <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-monitor"/></svg>The console</span>
+    <h2 class="split-words">A console that<br>explains every verdict.</h2>
+    <p>Real screenshots of the TRINETRA console analysing the benchmark week. Click a tab, or click the screen to open it full size.</p>
+  </div>
+  <div class="showcase" id="showcase">
+    <div class="browser">
+      <div class="br-bar"><span class="dots3" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="br-url"><svg class="ic"><use href="/static/img/icons.svg#i-lock"/></svg>127.0.0.1:5050<b id="br-path">/console</b></span>
+        <a class="br-open" href="/console">Open live<svg class="ic"><use href="/static/img/icons.svg#i-external-link"/></svg></a></div>
+      <div class="br-view" id="br-view"></div>
+    </div>
+    <div class="sc-tabs" id="sc-tabs" role="tablist" aria-label="Console screens"></div>
+  </div>
+</section>
+
+<!-- ============================== RESEARCH ============================== -->
+<section class="sec alt" id="research">
+  <div class="sec-head reveal">
+    <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-graduation-cap"/></svg>Built on research</span>
+    <h2>The research behind<br>every detector.</h2>
+    <p>Every part of TRINETRA traces back to peer-reviewed work from NDSS, CCS, IEEE S&amp;P, USENIX Security, KDD and leading statistics journals, plus government guidance on edge-device compromise.</p>
+  </div>
+  <div class="chips reveal" id="paper-filter" role="tablist" aria-label="Filter research">
+    <button class="chip active" data-f="all">All</button><button class="chip" data-f="network">Network</button>
+    <button class="chip" data-f="logs">Logs</button><button class="chip" data-f="stats">Statistics</button>
+    <button class="chip" data-f="host">Host / APT</button><button class="chip" data-f="guidance">Methodology</button>
+    <button class="chip" data-f="gov">Government</button>
+  </div>
+  <div class="papers" id="papers"></div>
+  <div class="center reveal"><a class="btn btn-ghost" href="/docs#/18-research-survey"><svg class="ic"><use href="/static/img/icons.svg#i-library"/></svg>Read the full worldwide research survey</a></div>
+</section>
+
+<!-- ============================== DOCS ============================== -->
+<section class="sec" id="docs">
+  <div class="sec-head reveal">
+    <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-book-open"/></svg>Documentation</span>
+    <h2>Everything explained,<br>diagram by diagram.</h2>
+    <p>19 pages with architecture, sequence and state diagrams, from the problem statement to the maths of every detector.</p>
+  </div>
+  <div class="doc-grid" id="doc-grid"></div>
+</section>
+
+<!-- ============================== START ============================== -->
+<section class="sec alt" id="start">
+  <div class="split">
+    <div class="reveal">
+      <span class="kicker"><svg class="ic"><use href="/static/img/icons.svg#i-terminal"/></svg>Get started</span>
+      <h2>Up and running<br>in one command.</h2>
+      <p class="muted">No GPU, no cloud, no internet connection. A week of 22 devices is analysed in about 30 seconds on a laptop CPU.</p>
+      <ul class="ticks">
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-check"/></svg>Agentless for routers &amp; firewalls (syslog, configs)</li>
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-check"/></svg>Native Slips module for live network traffic</li>
+        <li><svg class="ic"><use href="/static/img/icons.svg#i-check"/></svg>CEF export to Splunk, Elastic, QRadar, Wazuh</li>
+      </ul>
+    </div>
+    <div class="term reveal">
+      <div class="term-tabs" role="tablist">
+        <button class="tt active" data-t="demo"><svg class="ic"><use href="/static/img/icons.svg#i-laptop"/></svg>Demo (any OS)</button>
+        <button class="tt" data-t="linux"><svg class="ic b"><use href="/static/img/icons.svg#b-linux"/></svg>Linux + Slips</button>
+      </div>
+      <pre class="term-body" id="term-demo"><span class="c"># Windows · Linux · macOS</span>
+cd slips
+pip install -r compromise_dashboard/requirements.txt
+python -m compromise_dashboard
+<span class="c"># → http://127.0.0.1:5050</span></pre>
+      <pre class="term-body" id="term-linux" hidden><span class="c"># Ubuntu · Debian · Red Hat · Fedora · Kali (or Docker)</span>
+./slips.py -i eth0            <span class="c"># live capture</span>
+python -m compromise_dashboard \
+    --slips-output output/&lt;run&gt;</pre>
+      <button class="copy" id="copy"><svg class="ic"><use href="/static/img/icons.svg#i-copy"/></svg><span>Copy</span></button>
+    </div>
+  </div>
+</section>
+
+<section class="final">
+  <div class="final-card reveal">
+    <img class="final-bg" src="/static/img/photos/soc.jpg" alt="" aria-hidden="true" loading="lazy">
+    <span class="final-ico"><svg class="ic"><use href="/static/img/icons.svg#i-shield-check"/></svg></span>
+    <h2>Find out if you're already breached.</h2>
+    <p>Replay a full intrusion, open the forensic report of every device, and see why each verdict was reached.</p>
+    <div class="cta center"><a class="btn btn-primary" href="/console">Launch the console<svg class="ic"><use href="/static/img/icons.svg#i-arrow-right"/></svg></a><a class="btn btn-ghost" href="/docs#/15-presentation-guide">Presentation guide</a></div>
+  </div>
+</section>
+
+<section class="credits" id="credits">
+  <details>
+    <summary><svg class="ic"><use href="/static/img/icons.svg#i-badge-check"/></svg>Photo credits &amp; data sources</summary>
+    <div class="cr-grid">
+      <div><h4>Photographs (Wikimedia Commons)</h4><ul id="photo-credits"></ul></div>
+      <div><h4>Log captures (Stratosphere Laboratory, CTU Prague, shipped with Slips)</h4><ul id="data-credits"></ul></div>
+    </div>
+  </details>
+</section>
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-x" id="lb-x" aria-label="Close"><svg class="ic"><use href="/static/img/icons.svg#i-x"/></svg></button>
+  <figure><img id="lb-img" alt=""><figcaption id="lb-cap"></figcaption></figure>
+</div>
+
+<footer class="foot">
+  <div class="brand small"><span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2.5 4.5 7v8.2c0 7.1 4.9 12.4 11.5 14.3 6.6-1.9 11.5-7.2 11.5-14.3V7z" fill="currentColor"/><path d="M8.6 16c2-3.3 4.5-5 7.4-5s5.4 1.7 7.4 5c-2 3.3-4.5 5-7.4 5s-5.4-1.7-7.4-5z" fill="#fff"/><circle cx="16" cy="16" r="2.6" fill="currentColor"/></svg></span><span class="brand-name">TRINETRA</span></div>
+  <p>IoC-free compromise detection · an extension of Stratosphere Slips (GPL-2.0).<br>Icons: Lucide (ISC) and Simple Icons (CC0). Photos: Wikimedia Commons contributors (see credits). Brand marks belong to their owners and only name supported platforms.</p>
+  <nav><a href="/console">Console</a><a href="/docs">Docs</a><a href="https://github.com/stratosphereips/StratosphereLinuxIPS" rel="noopener">Slips on GitHub</a></nav>
+</footer>
+
+<script src="/static/js/landing.js"></script>
+</body>
+</html>
